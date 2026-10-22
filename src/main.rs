@@ -1,0 +1,440 @@
+mod bar;
+mod hook;
+mod state;
+mod tmux;
+mod ui;
+
+use hook::{HookInput, Outcome};
+use state::{PaneState, Status};
+use std::io::Read;
+
+const USAGE: &str = "\
+atc — air traffic control for tmux AI sessions
+
+usage:
+  atc hook <Event> [--kind <matcher>]   apply a Claude Code hook (reads JSON on stdin)
+  atc bar [session]                     render the fleet status row
+  atc status [--json]                   report every tracked session
+  atc state <status> [--title <t>]      report state for the current pane by hand
+  atc ui                                open the command center
+  atc seen <pane-id>                    drop a pane's escalation flag
+  atc doctor                            check the installation
+  atc install                           print the tmux and hook configuration
+  atc ask <question>                    ask Claude about the current fleet
+
+states: idle working waiting blocked error
+";
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(String::as_str).unwrap_or("help");
+    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+
+    match cmd {
+        "hook" => cmd_hook(rest),
+        "bar" => cmd_bar(rest),
+        "status" => cmd_status(rest),
+        "state" => cmd_state(rest),
+        "ui" => ui::run(),
+        "seen" => cmd_seen(rest),
+        "doctor" => cmd_doctor(),
+        "install" => print!("{}", install_text()),
+        "ask" => cmd_ask(rest),
+        "help" | "-h" | "--help" => print!("{USAGE}"),
+        other => {
+            eprintln!("atc: unknown command '{other}'\n");
+            print!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).map(String::as_str)
+}
+
+/// Hooks run on every tool call in every session, so this must never fail in a
+/// way Claude notices: all problems are logged and the exit code stays 0.
+fn cmd_hook(args: &[String]) {
+    let Some(event) = args.first() else {
+        log("hook called without an event name");
+        return;
+    };
+    let kind = flag(args, "--kind");
+
+    let Some(pane_id) = tmux::current_pane() else {
+        return; // not running under tmux; nothing to report to
+    };
+
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        log("could not read hook payload from stdin");
+    }
+    let input: HookInput = if raw.trim().is_empty() {
+        HookInput::default()
+    } else {
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                log(&format!("unparsable hook payload for {event}: {e}"));
+                HookInput::default()
+            }
+        }
+    };
+
+    let prev = state::load(&pane_id);
+    match hook::apply(event, kind, &input, &pane_id, prev) {
+        Outcome::Update(st) => {
+            if let Err(e) = state::save(&st) {
+                log(&format!("could not save state for {pane_id}: {e}"));
+            }
+            tmux::set_pane_option(&pane_id, "@atc_state", st.status.label());
+            refresh_window_for(&pane_id);
+            tmux::refresh_client();
+        }
+        Outcome::Remove => {
+            if let Err(e) = state::remove(&pane_id) {
+                log(&format!("could not clear state for {pane_id}: {e}"));
+            }
+            tmux::unset_pane_option(&pane_id, "@atc_state");
+            refresh_window_for(&pane_id);
+            tmux::refresh_client();
+        }
+        Outcome::Ignore => {}
+    }
+}
+
+/// Window-level glyphs are read straight out of `@atc_win` by the status
+/// format, which costs nothing to draw but has to be recomputed here.
+fn refresh_window_for(pane_id: &str) {
+    let panes = tmux::list_panes();
+    let live: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+    state::prune(&live);
+    let Some(info) = panes.iter().find(|p| p.pane_id == pane_id) else {
+        return;
+    };
+    let target = format!("{}:{}", info.session, info.window_index);
+    let states = state::all();
+    match bar::window_glyph(&states, &panes, &info.session, info.window_index) {
+        Some(glyph) => tmux::set_window_option(&target, "@atc_win", &glyph),
+        None => tmux::unset_window_option(&target, "@atc_win"),
+    }
+}
+
+fn cmd_bar(args: &[String]) {
+    let session = args
+        .first()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .or_else(tmux::current_session);
+    println!(
+        "{}",
+        bar::render(&state::all(), &tmux::list_panes(), session.as_deref())
+    );
+}
+
+fn cmd_status(args: &[String]) {
+    let states = state::all();
+    let panes = tmux::list_panes();
+    let entries = bar::live(&states, &panes);
+    let json = args.iter().any(|a| a == "--json");
+
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "pane_id": e.info.pane_id,
+                    "session": e.info.session,
+                    "window": e.info.window_index,
+                    "pane": e.info.pane_index,
+                    "address": format!("{}:{}", e.info.session, e.info.address()),
+                    "window_name": e.info.window_name,
+                    "status": e.state.status.label(),
+                    "stale": e.state.stale,
+                    "age_secs": e.state.age_secs(),
+                    "title": e.state.title,
+                    "cwd": e.state.cwd,
+                    "tool": e.state.tool,
+                    "last_message": e.state.last_message,
+                    "source": e.state.source,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({ "sessions": rows });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+        return;
+    }
+
+    if entries.is_empty() {
+        println!("no tracked sessions");
+        return;
+    }
+    for e in &entries {
+        let title = match e.state.title.as_deref().map(tmux::clean_title) {
+            Some(t) if !t.is_empty() => t,
+            _ => tmux::clean_title(&e.info.title),
+        };
+        println!(
+            "{} {:<18} {:<9} {:>5}  {}:{}{}",
+            e.state.status.glyph(),
+            truncate(&title, 18),
+            e.state.status.label(),
+            state::fmt_age(e.state.age_secs()),
+            e.info.session,
+            e.info.address(),
+            if e.state.stale { "  (stale)" } else { "" },
+        );
+        if let Some(msg) = &e.state.last_message {
+            println!("    {}", truncate(msg, 72));
+        }
+        if let Some(tool) = &e.state.tool {
+            println!("    tool: {tool}");
+        }
+    }
+}
+
+fn cmd_state(args: &[String]) {
+    let Some(raw) = args.first() else {
+        eprintln!("atc state: need a status (idle working waiting blocked error)");
+        std::process::exit(2);
+    };
+    let Some(status) = Status::parse(raw) else {
+        eprintln!("atc state: '{raw}' is not a status");
+        std::process::exit(2);
+    };
+    let Some(pane_id) = tmux::current_pane() else {
+        eprintln!("atc state: not running inside tmux");
+        std::process::exit(1);
+    };
+
+    let mut st = state::load(&pane_id).unwrap_or_else(|| PaneState::new(&pane_id));
+    if st.status != status {
+        st.since = state::now();
+        st.stale = false;
+    }
+    st.status = status;
+    st.source = "manual".to_string();
+    if let Some(t) = flag(args, "--title") {
+        st.title = Some(t.to_string());
+    }
+    if let Err(e) = state::save(&st) {
+        eprintln!("atc state: {e}");
+        std::process::exit(1);
+    }
+    tmux::set_pane_option(&pane_id, "@atc_state", st.status.label());
+    refresh_window_for(&pane_id);
+    tmux::refresh_client();
+}
+
+/// Called from tmux's after-select-pane hook: looking at a pane means you are
+/// no longer ignoring it, but it still wants a reply, so only `stale` clears.
+fn cmd_seen(args: &[String]) {
+    let Some(pane_id) = args.first() else {
+        return;
+    };
+    let Some(mut st) = state::load(pane_id) else {
+        return;
+    };
+    if !st.stale {
+        return;
+    }
+    st.stale = false;
+    if state::save(&st).is_ok() {
+        refresh_window_for(pane_id);
+        tmux::refresh_client();
+    }
+}
+
+fn cmd_doctor() {
+    let mut problems = 0;
+
+    match tmux::available() {
+        true => println!("ok    tmux found"),
+        false => {
+            println!("FAIL  tmux not on PATH");
+            problems += 1;
+        }
+    }
+
+    let dir = state::dir();
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => println!("ok    state dir {}", dir.display()),
+        Err(e) => {
+            println!("FAIL  state dir {}: {e}", dir.display());
+            problems += 1;
+        }
+    }
+
+    let settings = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".claude/settings.json"))
+        .unwrap_or_default();
+    match std::fs::read_to_string(&settings) {
+        Ok(body) if body.contains("atc hook") => println!("ok    hooks registered in {}", settings.display()),
+        Ok(_) => {
+            println!("WARN  no 'atc hook' entries in {} — run 'atc install'", settings.display());
+            problems += 1;
+        }
+        Err(e) => {
+            println!("WARN  cannot read {}: {e}", settings.display());
+            problems += 1;
+        }
+    }
+
+    match tmux::current_pane() {
+        Some(p) => println!("ok    running inside tmux pane {p}"),
+        None => println!("WARN  not inside tmux, so panes cannot be identified"),
+    }
+
+    let tracked = state::all().len();
+    println!("ok    {tracked} tracked pane(s)");
+
+    if problems > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn cmd_ask(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("atc ask: need a question");
+        std::process::exit(2);
+    }
+    let question = args.join(" ");
+    let states = state::all();
+    let panes = tmux::list_panes();
+    let entries = bar::live(&states, &panes);
+
+    let mut fleet = String::new();
+    for e in &entries {
+        fleet.push_str(&format!(
+            "- {}:{} [{}] {} (for {}){}\n",
+            e.info.session,
+            e.info.address(),
+            e.state.status.label(),
+            e.state.title.clone().unwrap_or_else(|| tmux::clean_title(&e.info.title)),
+            state::fmt_age(e.state.age_secs()),
+            e.state
+                .last_message
+                .as_ref()
+                .map(|m| format!("\n    last said: {m}"))
+                .unwrap_or_default(),
+        ));
+    }
+    if fleet.is_empty() {
+        fleet.push_str("(no sessions are currently tracked)\n");
+    }
+
+    let prompt = format!(
+        "These are my current AI coding sessions in tmux:\n\n{fleet}\nQuestion: {question}\n\n\
+         Answer briefly, and name the tmux address of any session I should go to."
+    );
+    let status = std::process::Command::new("claude")
+        .arg("-p")
+        .arg(&prompt)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("atc ask: could not run claude: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn install_text() -> String {
+    format!(
+        "# 1. tmux — source this, or copy it into your tmux.conf\n\n{}\n\
+         # 2. ~/.claude/settings.json — merge into the existing \"hooks\" object\n\n{}\n",
+        include_str!("../tmux/atc.conf"),
+        hooks_json()
+    )
+}
+
+fn hooks_json() -> String {
+    let events = [
+        ("SessionStart", None),
+        ("UserPromptSubmit", None),
+        ("PreToolUse", None),
+        ("PostToolUse", None),
+        ("PermissionRequest", None),
+        ("Stop", None),
+        ("StopFailure", None),
+        ("PostToolUseFailure", None),
+        ("SessionEnd", None),
+        ("Notification", Some("permission_prompt")),
+        ("Notification", Some("idle_prompt")),
+    ];
+    let mut out = String::from("{\n  \"hooks\": {\n");
+    let mut notification: Vec<String> = Vec::new();
+    let mut plain: Vec<String> = Vec::new();
+    for (event, kind) in events {
+        match kind {
+            Some(k) => notification.push(format!(
+                "      {{ \"matcher\": \"{k}\", \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook Notification --kind {k}\" }}] }}"
+            )),
+            None => plain.push(format!(
+                "    \"{event}\": [\n      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook {event}\" }}] }}\n    ]"
+            )),
+        }
+    }
+    plain.push(format!(
+        "    \"Notification\": [\n{}\n    ]",
+        notification.join(",\n")
+    ));
+    out.push_str(&plain.join(",\n"));
+    out.push_str("\n  }\n}");
+    out
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max.saturating_sub(1)).chain("…".chars()).collect()
+}
+
+fn log(msg: &str) {
+    use std::io::Write;
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(home).join(".local/state/atc/atc.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} {}", state::now(), msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_keeps_short_strings_intact() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn flag_reads_the_following_argument() {
+        let args: Vec<String> = ["--kind", "idle_prompt"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(flag(&args, "--kind"), Some("idle_prompt"));
+        assert_eq!(flag(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn generated_hooks_json_is_valid_and_covers_both_notification_matchers() {
+        let v: serde_json::Value = serde_json::from_str(&hooks_json()).expect("valid JSON");
+        let hooks = &v["hooks"];
+        assert!(hooks["Stop"].is_array());
+        let notif = hooks["Notification"].as_array().expect("notification array");
+        assert_eq!(notif.len(), 2);
+        let matchers: Vec<&str> = notif.iter().filter_map(|n| n["matcher"].as_str()).collect();
+        assert!(matchers.contains(&"permission_prompt"));
+        assert!(matchers.contains(&"idle_prompt"));
+    }
+}
