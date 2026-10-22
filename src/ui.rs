@@ -1,3 +1,4 @@
+use crate::pane::Kind;
 use crate::state::{self, Status};
 use crate::{bar, tmux};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -18,29 +19,50 @@ struct Item {
     window_index: u32,
     address: String,
     title: String,
-    status: Status,
+    kind: Kind,
+    status: Option<Status>,
     stale: bool,
-    age: u64,
+    age: Option<u64>,
     tool: Option<String>,
     last_message: Option<String>,
     repo: Option<String>,
     active: bool,
 }
 
+impl Item {
+    fn glyph(&self) -> &'static str {
+        match self.status {
+            Some(s) => s.glyph(),
+            None => self.kind.glyph(),
+        }
+    }
+
+    fn colour(&self) -> Color {
+        match self.status {
+            Some(Status::Idle) => Color::Indexed(244),
+            Some(Status::Working) => Color::Indexed(75),
+            Some(Status::Waiting) => Color::Indexed(208),
+            Some(Status::Blocked) => Color::Indexed(171),
+            Some(Status::Error) => Color::Indexed(196),
+            None => match self.kind {
+                Kind::Unreported | Kind::Job => Color::Indexed(244),
+                _ => Color::Indexed(240),
+            },
+        }
+    }
+
+    fn state_label(&self) -> &'static str {
+        match self.status {
+            Some(s) => s.label(),
+            None => self.kind.label(),
+        }
+    }
+}
+
 enum Mode {
     Browse,
     Prompt(String),
     ConfirmKill,
-}
-
-fn colour(status: Status) -> Color {
-    match status {
-        Status::Idle => Color::Indexed(244),
-        Status::Working => Color::Indexed(75),
-        Status::Waiting => Color::Indexed(208),
-        Status::Blocked => Color::Indexed(171),
-        Status::Error => Color::Indexed(196),
-    }
 }
 
 fn repo_label(cwd: &str, cache: &mut HashMap<String, Option<String>>) -> Option<String> {
@@ -66,41 +88,37 @@ fn repo_label(cwd: &str, cache: &mut HashMap<String, Option<String>>) -> Option<
     label
 }
 
-/// State carries a title only for hooked sessions; anything reporting through
-/// `atc state` falls back to what tmux knows about the pane.
-fn pick_title(from_state: Option<&str>, pane_title: &str, window_name: &str) -> String {
-    for candidate in [from_state.unwrap_or(""), pane_title, window_name] {
-        let cleaned = tmux::clean_title(candidate);
-        if !cleaned.is_empty() {
-            return cleaned;
-        }
-    }
-    String::new()
-}
-
-fn snapshot(cache: &mut HashMap<String, Option<String>>) -> Vec<Item> {
+/// Inventory is already sorted AI-first, so the AI section is a prefix of this
+/// list and hiding the rest is just a shorter slice.
+fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, usize) {
     let states = state::all();
     let panes = tmux::list_panes();
-    bar::live(&states, &panes)
+    let inv = bar::inventory(&states, &panes);
+    let ai_count = inv.iter().filter(|e| e.kind.is_ai()).count();
+    let items = inv
         .iter()
         .map(|e| Item {
             pane_id: e.info.pane_id.clone(),
             session: e.info.session.clone(),
             window_index: e.info.window_index,
             address: format!("{}:{}", e.info.session, e.info.address()),
-            title: pick_title(e.state.title.as_deref(), &e.info.title, &e.info.window_name),
-            status: e.state.status,
-            stale: e.state.stale,
-            age: e.state.age_secs(),
-            tool: e.state.tool.clone(),
-            last_message: e.state.last_message.clone(),
+            title: e.title(),
+            kind: e.kind,
+            status: e.status(),
+            stale: e.stale(),
+            age: e.state.map(|s| s.age_secs()),
+            tool: e.state.and_then(|s| s.tool.clone()),
+            last_message: e.state.and_then(|s| s.last_message.clone()),
             repo: repo_label(
-                e.state.cwd.as_deref().unwrap_or(&e.info.path),
+                e.state
+                    .and_then(|s| s.cwd.as_deref())
+                    .unwrap_or(&e.info.path),
                 cache,
             ),
-            active: e.info.active,
+            active: e.info.is_current(),
         })
-        .collect()
+        .collect();
+    (items, ai_count)
 }
 
 pub fn run() {
@@ -117,14 +135,17 @@ fn event_loop() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let mut cache: HashMap<String, Option<String>> = HashMap::new();
-    let mut items = snapshot(&mut cache);
+    let (mut items, mut ai_count) = snapshot(&mut cache);
     let mut selected: usize = 0;
+    let mut show_others = true;
     let mut mode = Mode::Browse;
     let mut last_refresh = Instant::now();
     let mut jump: Option<(String, String, u32)> = None;
 
     loop {
-        terminal.draw(|f| draw(f, &items, selected, &mode))?;
+        let visible = if show_others { items.len() } else { ai_count };
+        selected = selected.min(visible.saturating_sub(1));
+        terminal.draw(|f| draw(f, &items, ai_count, visible, selected, &mode))?;
 
         if event::poll(Duration::from_millis(300))? {
             if let Event::Key(key) = event::read()? {
@@ -154,8 +175,7 @@ fn event_loop() -> io::Result<()> {
                                 tmux::kill_pane(&item.pane_id);
                                 let _ = state::remove(&item.pane_id);
                             }
-                            items = snapshot(&mut cache);
-                            selected = selected.min(items.len().saturating_sub(1));
+                            (items, ai_count) = snapshot(&mut cache);
                             mode = Mode::Browse;
                         }
                         _ => mode = Mode::Browse,
@@ -164,20 +184,26 @@ fn event_loop() -> io::Result<()> {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                         KeyCode::Char('j') | KeyCode::Down => {
-                            if !items.is_empty() {
-                                selected = (selected + 1).min(items.len() - 1);
+                            if visible > 0 {
+                                selected = (selected + 1).min(visible - 1);
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             selected = selected.saturating_sub(1);
                         }
                         KeyCode::Char('g') => selected = 0,
-                        KeyCode::Char('G') => selected = items.len().saturating_sub(1),
+                        KeyCode::Char('G') => selected = visible.saturating_sub(1),
+                        KeyCode::Tab => show_others = !show_others,
                         KeyCode::Char('r') => {
                             cache.clear();
-                            items = snapshot(&mut cache);
+                            (items, ai_count) = snapshot(&mut cache);
                         }
-                        KeyCode::Char('p') => mode = Mode::Prompt(String::new()),
+                        KeyCode::Char('p') => {
+                            // Only an AI session can take a prompt.
+                            if items.get(selected).is_some_and(|i| i.kind.is_ai()) {
+                                mode = Mode::Prompt(String::new());
+                            }
+                        }
                         KeyCode::Char('x') => {
                             if !items.is_empty() {
                                 mode = Mode::ConfirmKill;
@@ -200,10 +226,7 @@ fn event_loop() -> io::Result<()> {
         }
 
         if last_refresh.elapsed() > Duration::from_secs(1) {
-            items = snapshot(&mut cache);
-            if !items.is_empty() {
-                selected = selected.min(items.len() - 1);
-            }
+            (items, ai_count) = snapshot(&mut cache);
             last_refresh = Instant::now();
         }
     }
@@ -219,92 +242,121 @@ fn event_loop() -> io::Result<()> {
     Ok(())
 }
 
-fn draw(f: &mut ratatui::Frame, items: &[Item], selected: usize, mode: &Mode) {
+fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
+    let mut glyph_style = Style::default().fg(item.colour());
+    if item.stale {
+        glyph_style = glyph_style.add_modifier(Modifier::BOLD);
+    }
+    let mut base = if chosen {
+        Style::default().bg(Color::Indexed(237)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    if dim && !chosen {
+        base = base.fg(Color::Indexed(243));
+    }
+    Line::from(vec![
+        Span::styled(if chosen { " ▌" } else { "  " }, base),
+        Span::styled(if item.active { "▸" } else { " " }, base.fg(Color::Indexed(250))),
+        Span::styled(format!("{} ", item.glyph()), glyph_style),
+        Span::styled(format!("{:<26} ", crop(&item.title, 26)), base),
+        Span::styled(format!("{:<11} ", item.state_label()), Style::default().fg(item.colour())),
+        Span::styled(
+            format!(
+                "{:>5}  ",
+                item.age.map(state::fmt_age).unwrap_or_else(|| "-".to_string())
+            ),
+            base.fg(Color::Indexed(244)),
+        ),
+        Span::styled(format!("{:<22} ", crop(&item.address, 22)), base.fg(Color::Indexed(250))),
+        Span::styled(item.repo.clone().unwrap_or_default(), base.fg(Color::Indexed(244))),
+    ])
+}
+
+fn draw(
+    f: &mut ratatui::Frame,
+    items: &[Item],
+    ai_count: usize,
+    visible: usize,
+    selected: usize,
+    mode: &Mode,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(f.area());
 
     let mut lines: Vec<Line> = Vec::new();
-    if items.is_empty() {
+    if ai_count == 0 {
         lines.push(Line::from(Span::styled(
-            "  no tracked sessions — start a Claude session in a tmux pane",
+            "  no AI sessions — start a Claude session in a tmux pane",
             Style::default().fg(Color::Indexed(244)),
         )));
     }
-    for (i, item) in items.iter().enumerate() {
-        let chosen = i == selected;
-        let mut glyph = Style::default().fg(colour(item.status));
-        if item.stale {
-            glyph = glyph.add_modifier(Modifier::BOLD);
+
+    for (i, item) in items.iter().take(visible).enumerate() {
+        if i == ai_count {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  other panes",
+                Style::default().fg(Color::Indexed(240)).add_modifier(Modifier::ITALIC),
+            )));
         }
-        let base = if chosen {
-            Style::default().bg(Color::Indexed(237)).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(if chosen { " ▌" } else { "  " }, base),
-            Span::styled(
-                if item.active { "▸" } else { " " },
-                base.fg(Color::Indexed(250)),
-            ),
-            Span::styled(format!("{} ", item.status.glyph()), glyph),
-            Span::styled(format!("{:<28} ", crop(&item.title, 28)), base),
-            Span::styled(
-                format!("{:<8} ", item.status.label()),
-                Style::default().fg(colour(item.status)),
-            ),
-            Span::styled(
-                format!("{:>5}  ", state::fmt_age(item.age)),
-                base.fg(Color::Indexed(244)),
-            ),
-            Span::styled(
-                format!("{:<22} ", crop(&item.address, 22)),
-                base.fg(Color::Indexed(250)),
-            ),
-            Span::styled(
-                item.repo.clone().unwrap_or_default(),
-                base.fg(Color::Indexed(244)),
-            ),
-        ]));
+        let chosen = i == selected;
+        lines.push(item_line(item, chosen, i >= ai_count));
         if chosen {
             if let Some(tool) = &item.tool {
                 lines.push(Line::from(Span::styled(
-                    format!("      needs: {tool}"),
+                    format!("        needs: {tool}"),
                     Style::default().fg(Color::Indexed(171)),
                 )));
             }
             if let Some(msg) = &item.last_message {
                 lines.push(Line::from(Span::styled(
-                    format!("      └ {}", crop(msg, 100)),
+                    format!("        └ {}", crop(msg, 100)),
                     Style::default().fg(Color::Indexed(248)),
+                )));
+            }
+            if item.kind == Kind::Unreported {
+                lines.push(Line::from(Span::styled(
+                    "        └ hasn't reported yet — state appears on its next activity",
+                    Style::default().fg(Color::Indexed(244)),
                 )));
             }
         }
     }
 
-    let waiting = items
+    let needs_you = items
         .iter()
-        .filter(|i| matches!(i.status, Status::Waiting | Status::Blocked | Status::Error))
+        .take(ai_count)
+        .filter(|i| matches!(i.status, Some(Status::Waiting | Status::Blocked | Status::Error)))
         .count();
-    let title = format!(" atc — {} session(s), {waiting} need you ", items.len());
+    let hidden = items.len() - visible;
+    let title = if hidden > 0 {
+        format!(" atc — {ai_count} session(s), {needs_you} need you, {hidden} pane(s) hidden ")
+    } else {
+        format!(" atc — {ai_count} session(s), {needs_you} need you ")
+    };
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         chunks[0],
     );
 
+    let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Indexed(75)));
     let footer = match mode {
         Mode::Browse => Line::from(vec![
-            Span::styled(" enter", Style::default().fg(Color::Indexed(75))),
+            Span::raw(" "),
+            key("enter"),
             Span::raw(" jump   "),
-            Span::styled("p", Style::default().fg(Color::Indexed(75))),
+            key("p"),
             Span::raw(" prompt   "),
-            Span::styled("x", Style::default().fg(Color::Indexed(75))),
+            key("x"),
             Span::raw(" kill   "),
-            Span::styled("r", Style::default().fg(Color::Indexed(75))),
+            key("tab"),
+            Span::raw(" other panes   "),
+            key("r"),
             Span::raw(" refresh   "),
-            Span::styled("q", Style::default().fg(Color::Indexed(75))),
+            key("q"),
             Span::raw(" close"),
         ]),
         Mode::Prompt(buf) => Line::from(vec![

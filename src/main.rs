@@ -1,5 +1,6 @@
 mod bar;
 mod hook;
+mod pane;
 mod state;
 mod tmux;
 mod ui;
@@ -13,7 +14,7 @@ atc — air traffic control for tmux AI sessions
 
 usage:
   atc hook <Event> [--kind <matcher>]   apply a Claude Code hook (reads JSON on stdin)
-  atc bar [session]                     render the fleet status row
+  atc bar [session] [--all]             render the fleet status row
   atc status [--json]                   report every tracked session
   atc state <status> [--title <t>]      report state for the current pane by hand
   atc ui                                open the command center
@@ -128,25 +129,26 @@ fn refresh_window_for(pane_id: &str) {
 }
 
 fn cmd_bar(args: &[String]) {
+    let all = args.iter().any(|a| a == "--all");
     let session = args
-        .first()
-        .filter(|s| !s.is_empty())
+        .iter()
+        .find(|a| !a.starts_with("--") && !a.is_empty())
         .cloned()
         .or_else(tmux::current_session);
-    println!(
-        "{}",
-        bar::render(&state::all(), &tmux::list_panes(), session.as_deref())
-    );
+    let states = state::all();
+    let panes = tmux::list_panes();
+    let inv = bar::inventory(&states, &panes);
+    println!("{}", bar::render(&inv, session.as_deref(), all));
 }
 
 fn cmd_status(args: &[String]) {
     let states = state::all();
     let panes = tmux::list_panes();
-    let entries = bar::live(&states, &panes);
+    let inv = bar::inventory(&states, &panes);
     let json = args.iter().any(|a| a == "--json");
 
     if json {
-        let rows: Vec<serde_json::Value> = entries
+        let rows: Vec<serde_json::Value> = inv
             .iter()
             .map(|e| {
                 serde_json::json!({
@@ -156,46 +158,62 @@ fn cmd_status(args: &[String]) {
                     "pane": e.info.pane_index,
                     "address": format!("{}:{}", e.info.session, e.info.address()),
                     "window_name": e.info.window_name,
-                    "status": e.state.status.label(),
-                    "stale": e.state.stale,
-                    "age_secs": e.state.age_secs(),
-                    "title": e.state.title,
-                    "cwd": e.state.cwd,
-                    "tool": e.state.tool,
-                    "last_message": e.state.last_message,
-                    "source": e.state.source,
+                    "kind": e.kind.label(),
+                    "command": e.info.command,
+                    "status": e.status().map(|s| s.label()),
+                    "stale": e.stale(),
+                    "age_secs": e.state.map(|s| s.age_secs()),
+                    "title": e.title(),
+                    "cwd": e.state.and_then(|s| s.cwd.clone()).unwrap_or_else(|| e.info.path.clone()),
+                    "tool": e.state.and_then(|s| s.tool.clone()),
+                    "last_message": e.state.and_then(|s| s.last_message.clone()),
                 })
             })
             .collect();
-        let doc = serde_json::json!({ "sessions": rows });
+        let doc = serde_json::json!({ "panes": rows });
         println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
         return;
     }
 
-    if entries.is_empty() {
-        println!("no tracked sessions");
-        return;
+    let (ai, others): (Vec<&bar::Entry>, Vec<&bar::Entry>) =
+        inv.iter().partition(|e| e.kind.is_ai());
+
+    if ai.is_empty() {
+        println!("no AI sessions");
     }
-    for e in &entries {
-        let title = match e.state.title.as_deref().map(tmux::clean_title) {
-            Some(t) if !t.is_empty() => t,
-            _ => tmux::clean_title(&e.info.title),
-        };
+    for e in &ai {
         println!(
-            "{} {:<18} {:<9} {:>5}  {}:{}{}",
-            e.state.status.glyph(),
-            truncate(&title, 18),
-            e.state.status.label(),
-            state::fmt_age(e.state.age_secs()),
+            "{} {:<18} {:<11} {:>5}  {}:{}{}",
+            e.glyph(),
+            truncate(&e.title(), 18),
+            e.status().map(|s| s.label()).unwrap_or_else(|| e.kind.label()),
+            e.state
+                .map(|s| state::fmt_age(s.age_secs()))
+                .unwrap_or_else(|| "-".to_string()),
             e.info.session,
             e.info.address(),
-            if e.state.stale { "  (stale)" } else { "" },
+            if e.stale() { "  (stale)" } else { "" },
         );
-        if let Some(msg) = &e.state.last_message {
+        if let Some(msg) = e.state.and_then(|s| s.last_message.as_ref()) {
             println!("    {}", truncate(msg, 72));
         }
-        if let Some(tool) = &e.state.tool {
+        if let Some(tool) = e.state.and_then(|s| s.tool.as_ref()) {
             println!("    tool: {tool}");
+        }
+    }
+
+    if !others.is_empty() {
+        println!("\nother panes");
+        for e in &others {
+            println!(
+                "{} {:<18} {:<11} {:>5}  {}:{}",
+                e.glyph(),
+                truncate(&e.title(), 18),
+                e.kind.label(),
+                "",
+                e.info.session,
+                e.info.address(),
+            );
         }
     }
 }
@@ -308,20 +326,21 @@ fn cmd_ask(args: &[String]) {
     let question = args.join(" ");
     let states = state::all();
     let panes = tmux::list_panes();
-    let entries = bar::live(&states, &panes);
+    let inv = bar::inventory(&states, &panes);
 
     let mut fleet = String::new();
-    for e in &entries {
+    for e in inv.iter().filter(|e| e.kind.is_ai()) {
         fleet.push_str(&format!(
             "- {}:{} [{}] {} (for {}){}\n",
             e.info.session,
             e.info.address(),
-            e.state.status.label(),
-            e.state.title.clone().unwrap_or_else(|| tmux::clean_title(&e.info.title)),
-            state::fmt_age(e.state.age_secs()),
+            e.status().map(|s| s.label()).unwrap_or("state unknown"),
+            e.title(),
             e.state
-                .last_message
-                .as_ref()
+                .map(|s| state::fmt_age(s.age_secs()))
+                .unwrap_or_else(|| "unknown".to_string()),
+            e.state
+                .and_then(|s| s.last_message.as_ref())
                 .map(|m| format!("\n    last said: {m}"))
                 .unwrap_or_default(),
         ));

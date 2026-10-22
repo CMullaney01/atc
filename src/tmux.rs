@@ -10,13 +10,23 @@ pub struct PaneInfo {
     pub window_name: String,
     pub pane_index: u32,
     pub active: bool,
+    pub window_active: bool,
+    pub session_attached: bool,
     pub title: String,
+    pub command: String,
     pub path: String,
 }
 
 impl PaneInfo {
     pub fn address(&self) -> String {
         format!("{}.{}", self.window_index, self.pane_index)
+    }
+
+    /// `pane_active` is per-window, so on its own it is true for one pane in
+    /// every window. The pane the user is actually sitting in is the active
+    /// pane of the active window of an attached session.
+    pub fn is_current(&self) -> bool {
+        self.active && self.window_active && self.session_attached
     }
 }
 
@@ -39,7 +49,9 @@ pub fn available() -> bool {
 pub fn list_panes() -> Vec<PaneInfo> {
     let fmt = format!(
         "#{{pane_id}}{s}#{{session_name}}{s}#{{window_index}}{s}#{{window_name}}{s}\
-         #{{pane_index}}{s}#{{?pane_active,1,0}}{s}#{{pane_title}}{s}#{{pane_current_path}}",
+         #{{pane_index}}{s}#{{?pane_active,1,0}}{s}#{{?window_active,1,0}}{s}\
+         #{{?session_attached,1,0}}{s}#{{pane_title}}{s}\
+         #{{pane_current_command}}{s}#{{pane_current_path}}",
         s = SEP
     );
     let Some(out) = run(&["list-panes", "-a", "-F", &fmt]) else {
@@ -50,7 +62,7 @@ pub fn list_panes() -> Vec<PaneInfo> {
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() < 8 {
+    if f.len() < 11 {
         return None;
     }
     Some(PaneInfo {
@@ -60,8 +72,11 @@ fn parse_pane_line(line: &str) -> Option<PaneInfo> {
         window_name: f[3].to_string(),
         pane_index: f[4].parse().ok()?,
         active: f[5] == "1",
-        title: f[6].to_string(),
-        path: f[7].to_string(),
+        window_active: f[6] == "1",
+        session_attached: f[7] == "1",
+        title: f[8].to_string(),
+        command: f[9].to_string(),
+        path: f[10].to_string(),
     })
 }
 
@@ -135,7 +150,7 @@ mod tests {
     #[test]
     fn parses_a_pane_line() {
         let line = format!(
-            "%6{s}myworkspace{s}0{s}nvim{s}1{s}1{s}✳ fix-lint{s}/Users/c/dev/atc",
+            "%6{s}myworkspace{s}0{s}nvim{s}1{s}1{s}1{s}1{s}✳ fix-lint{s}2.1.308{s}/Users/c/dev/atc",
             s = SEP
         );
         let p = parse_pane_line(&line).expect("should parse");
@@ -144,8 +159,21 @@ mod tests {
         assert_eq!(p.window_index, 0);
         assert_eq!(p.pane_index, 1);
         assert!(p.active);
+        assert!(p.is_current(), "active pane of an active window in an attached session");
         assert_eq!(p.address(), "0.1");
+        assert_eq!(p.command, "2.1.308");
         assert_eq!(p.path, "/Users/c/dev/atc");
+    }
+
+    #[test]
+    fn an_active_pane_in_a_background_window_is_not_current() {
+        let line = format!(
+            "%9{s}ws{s}2{s}other{s}0{s}1{s}0{s}1{s}title{s}zsh{s}/tmp",
+            s = SEP
+        );
+        let p = parse_pane_line(&line).expect("should parse");
+        assert!(p.active, "it is active within its own window");
+        assert!(!p.is_current(), "but that window is not the active one");
     }
 
     #[test]
