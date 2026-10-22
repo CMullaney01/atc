@@ -84,14 +84,19 @@ fn cmd_hook(args: &[String]) {
     };
 
     let prev = state::load(&pane_id);
+    let was = prev.as_ref().map(|p| (p.status, p.stale));
     match hook::apply(event, kind, &input, &pane_id, prev) {
         Outcome::Update(st) => {
             if let Err(e) = state::save(&st) {
                 log(&format!("could not save state for {pane_id}: {e}"));
             }
-            tmux::set_pane_option(&pane_id, "@atc_state", st.status.label());
-            refresh_window_for(&pane_id);
-            tmux::refresh_client();
+            // Tool events fire constantly; only touch tmux when what the bar
+            // actually draws has changed.
+            if was != Some((st.status, st.stale)) {
+                tmux::set_pane_option(&pane_id, "@atc_state", st.status.label());
+                refresh_window_for(&pane_id);
+                tmux::refresh_client();
+            }
         }
         Outcome::Remove => {
             if let Err(e) = state::remove(&pane_id) {
