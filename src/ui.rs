@@ -1,5 +1,7 @@
-//! The popup you bring up to see every session at once. It owns the terminal
-//! while it is open, so it puts the screen back before it moves the tmux client.
+//! The popup you bring up to see every session at once, with a live view of
+//! whichever one is selected so you can read it without going there. It owns the
+//! terminal while it is open, so it puts the screen back before it moves the
+//! tmux client.
 use crate::pane::Kind;
 use crate::state::{self, Status};
 use crate::{bar, tmux};
@@ -17,6 +19,9 @@ use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
+/// How long a captured screen is reused before it is taken again.
+const PREVIEW_MAX_AGE: Duration = Duration::from_millis(700);
+
 struct Item {
     pane_id: String,
     session: String,
@@ -27,8 +32,6 @@ struct Item {
     status: Option<Status>,
     stale: bool,
     age: Option<u64>,
-    tool: Option<String>,
-    last_message: Option<String>,
     repo: Option<String>,
     active: bool,
 }
@@ -67,6 +70,85 @@ enum Mode {
     Browse,
     Prompt(String),
     ConfirmKill,
+}
+
+/// The screen of one pane, kept between frames so every redraw does not shell
+/// out to tmux.
+struct Preview {
+    pane_id: String,
+    lines: Vec<String>,
+    taken: Instant,
+}
+
+impl Preview {
+    fn blank() -> Self {
+        Preview {
+            pane_id: String::new(),
+            lines: Vec::new(),
+            taken: Instant::now() - PREVIEW_MAX_AGE,
+        }
+    }
+
+    fn follow(&mut self, pane_id: Option<&str>) {
+        let Some(pane_id) = pane_id else {
+            self.pane_id.clear();
+            self.lines.clear();
+            return;
+        };
+        if self.pane_id == pane_id && self.taken.elapsed() < PREVIEW_MAX_AGE {
+            return;
+        }
+        self.pane_id = pane_id.to_string();
+        self.lines = tmux::capture_pane(pane_id);
+        self.taken = Instant::now();
+    }
+
+    /// The bottom of a pane's screen is the part worth reading, so a short
+    /// window shows the end rather than the beginning.
+    fn tail(&self, height: usize) -> &[String] {
+        let start = self.lines.len().saturating_sub(height);
+        &self.lines[start..]
+    }
+}
+
+/// One drawn line of the list: either a section heading or one pane.
+enum Row {
+    Heading(&'static str),
+    Pane(usize),
+}
+
+/// Inventory is sorted AI-first, so the heading goes in front of the first
+/// non-AI pane and nowhere else.
+fn rows(ai_count: usize, visible: usize) -> Vec<Row> {
+    let mut out = Vec::with_capacity(visible + 1);
+    for i in 0..visible {
+        if i == ai_count {
+            out.push(Row::Heading("other panes"));
+        }
+        out.push(Row::Pane(i));
+    }
+    out
+}
+
+/// The chosen pane sits one row lower once the heading is on screen above it.
+fn row_of(selected: usize, ai_count: usize, visible: usize) -> usize {
+    selected + usize::from(ai_count < visible && selected >= ai_count)
+}
+
+/// Scroll only when the chosen row would otherwise fall off an edge, so the
+/// list stays still while you move around inside it.
+fn scroll_offset(total_rows: usize, height: usize, chosen_row: usize, current: usize) -> usize {
+    if height == 0 {
+        return 0;
+    }
+    let furthest = total_rows.saturating_sub(height);
+    let mut offset = current.min(furthest);
+    if chosen_row < offset {
+        offset = chosen_row;
+    } else if chosen_row >= offset + height {
+        offset = chosen_row + 1 - height;
+    }
+    offset.min(furthest)
 }
 
 fn repo_label(cwd: &str, cache: &mut HashMap<String, Option<String>>) -> Option<String> {
@@ -111,8 +193,6 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, usize) {
             status: e.status(),
             stale: e.stale(),
             age: e.state.map(|s| s.age_secs()),
-            tool: e.state.and_then(|s| s.tool.clone()),
-            last_message: e.state.and_then(|s| s.last_message.clone()),
             repo: repo_label(
                 e.state
                     .and_then(|s| s.cwd.as_deref())
@@ -141,15 +221,29 @@ fn event_loop() -> io::Result<()> {
     let mut cache: HashMap<String, Option<String>> = HashMap::new();
     let (mut items, mut ai_count) = snapshot(&mut cache);
     let mut selected: usize = 0;
+    let mut offset: usize = 0;
     let mut show_others = true;
     let mut mode = Mode::Browse;
+    let mut preview = Preview::blank();
     let mut last_refresh = Instant::now();
     let mut jump: Option<(String, String, u32)> = None;
 
     loop {
         let visible = if show_others { items.len() } else { ai_count };
         selected = selected.min(visible.saturating_sub(1));
-        terminal.draw(|f| draw(f, &items, ai_count, visible, selected, &mode))?;
+        preview.follow(items.get(selected).map(|i| i.pane_id.as_str()));
+
+        terminal.draw(|f| {
+            let view = View {
+                items: &items,
+                ai_count,
+                visible,
+                selected,
+                mode: &mode,
+                preview: &preview,
+            };
+            offset = draw(f, &view, offset);
+        })?;
 
         if event::poll(Duration::from_millis(300))? {
             if let Event::Key(key) = event::read()? {
@@ -295,64 +389,63 @@ fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
     ])
 }
 
-fn draw(
-    f: &mut ratatui::Frame,
-    items: &[Item],
+struct View<'a> {
+    items: &'a [Item],
     ai_count: usize,
     visible: usize,
     selected: usize,
-    mode: &Mode,
-) {
-    let chunks = Layout::default()
+    mode: &'a Mode,
+    preview: &'a Preview,
+}
+
+/// Returns the scroll offset it settled on, so the next frame starts where this
+/// one left off.
+fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
+    let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
         .split(f.area());
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(outer[0]);
+
+    let all_rows = rows(v.ai_count, v.visible);
+    let empty_notice = usize::from(v.ai_count == 0);
+    let list_height = usize::from(split[0].height.saturating_sub(2)).saturating_sub(empty_notice);
+    let offset = scroll_offset(
+        all_rows.len(),
+        list_height,
+        row_of(v.selected, v.ai_count, v.visible),
+        offset,
+    );
 
     let mut lines: Vec<Line> = Vec::new();
-    if ai_count == 0 {
+    if v.ai_count == 0 {
         lines.push(Line::from(Span::styled(
             "  no AI sessions — start a Claude session in a tmux pane",
             Style::default().fg(Color::Indexed(244)),
         )));
     }
-
-    for (i, item) in items.iter().take(visible).enumerate() {
-        if i == ai_count {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  other panes",
+    for row in all_rows.iter().skip(offset).take(list_height) {
+        match row {
+            Row::Heading(text) => lines.push(Line::from(Span::styled(
+                format!("  {text}"),
                 Style::default()
                     .fg(Color::Indexed(240))
                     .add_modifier(Modifier::ITALIC),
-            )));
-        }
-        let chosen = i == selected;
-        lines.push(item_line(item, chosen, i >= ai_count));
-        if chosen {
-            if let Some(tool) = &item.tool {
-                lines.push(Line::from(Span::styled(
-                    format!("        needs: {tool}"),
-                    Style::default().fg(Color::Indexed(171)),
-                )));
-            }
-            if let Some(msg) = &item.last_message {
-                lines.push(Line::from(Span::styled(
-                    format!("        └ {}", crop(msg, 100)),
-                    Style::default().fg(Color::Indexed(248)),
-                )));
-            }
-            if item.kind == Kind::Unreported {
-                lines.push(Line::from(Span::styled(
-                    "        └ hasn't reported yet — state appears on its next activity",
-                    Style::default().fg(Color::Indexed(244)),
-                )));
+            ))),
+            Row::Pane(i) => {
+                let item = &v.items[*i];
+                lines.push(item_line(item, *i == v.selected, *i >= v.ai_count));
             }
         }
     }
 
-    let needs_you = items
+    let needs_you = v
+        .items
         .iter()
-        .take(ai_count)
+        .take(v.ai_count)
         .filter(|i| {
             matches!(
                 i.status,
@@ -360,19 +453,60 @@ fn draw(
             )
         })
         .count();
-    let hidden = items.len() - visible;
+    let hidden = v.items.len() - v.visible;
     let title = if hidden > 0 {
-        format!(" atc — {ai_count} session(s), {needs_you} need you, {hidden} pane(s) hidden ")
+        format!(
+            " atc — {} session(s), {needs_you} need you, {hidden} pane(s) hidden ",
+            v.ai_count
+        )
     } else {
-        format!(" atc — {ai_count} session(s), {needs_you} need you ")
+        format!(" atc — {} session(s), {needs_you} need you ", v.ai_count)
     };
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
-        chunks[0],
+        split[0],
     );
 
+    draw_preview(f, v, split[1]);
+    draw_footer(f, v, outer[1]);
+    offset
+}
+
+fn draw_preview(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
+    let chosen = v.items.get(v.selected);
+    let title = match chosen {
+        Some(item) => match &item.repo {
+            Some(repo) => format!(" {} · {repo} ", item.address),
+            None => format!(" {} ", item.address),
+        },
+        None => " nothing to show ".to_string(),
+    };
+    let height = usize::from(area.height.saturating_sub(2));
+    let body: Vec<Line> = v
+        .preview
+        .tail(height)
+        .iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(Color::Indexed(250)),
+            ))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_style(Style::default().fg(Color::Indexed(75))),
+        ),
+        area,
+    );
+}
+
+fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
     let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Indexed(75)));
-    let footer = match mode {
+    let footer = match v.mode {
         Mode::Browse => Line::from(vec![
             Span::raw(" "),
             key("enter"),
@@ -396,8 +530,8 @@ fn draw(
         Mode::ConfirmKill => Line::from(Span::styled(
             format!(
                 " kill {}?  y / any other key to cancel",
-                items
-                    .get(selected)
+                v.items
+                    .get(v.selected)
                     .map(|i| i.address.as_str())
                     .unwrap_or("")
             ),
@@ -406,7 +540,7 @@ fn draw(
     };
     f.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
-        chunks[1],
+        area,
     );
 }
 
@@ -418,4 +552,66 @@ fn crop(s: &str, max: usize) -> String {
         .take(max.saturating_sub(1))
         .chain("…".chars())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_goes_in_front_of_the_first_non_ai_pane() {
+        let laid_out: Vec<String> = rows(2, 4)
+            .iter()
+            .map(|r| match r {
+                Row::Heading(t) => (*t).to_string(),
+                Row::Pane(i) => i.to_string(),
+            })
+            .collect();
+        assert_eq!(laid_out, ["0", "1", "other panes", "2", "3"]);
+    }
+
+    #[test]
+    fn no_heading_when_the_other_panes_are_hidden() {
+        assert_eq!(rows(2, 2).len(), 2);
+    }
+
+    #[test]
+    fn chosen_row_accounts_for_the_heading_above_it() {
+        assert_eq!(row_of(1, 2, 4), 1);
+        assert_eq!(row_of(2, 2, 4), 3);
+        assert_eq!(row_of(1, 2, 2), 1);
+        assert_eq!(row_of(0, 0, 3), 1);
+    }
+
+    #[test]
+    fn list_does_not_move_while_the_chosen_row_is_in_view() {
+        assert_eq!(scroll_offset(20, 10, 5, 0), 0);
+        assert_eq!(scroll_offset(20, 10, 9, 0), 0);
+    }
+
+    #[test]
+    fn list_follows_the_chosen_row_off_either_edge() {
+        assert_eq!(scroll_offset(20, 10, 10, 0), 1);
+        assert_eq!(scroll_offset(20, 10, 3, 8), 3);
+    }
+
+    #[test]
+    fn list_never_scrolls_past_the_last_row() {
+        assert_eq!(scroll_offset(12, 10, 11, 9), 2);
+        assert_eq!(scroll_offset(4, 10, 3, 0), 0);
+    }
+
+    #[test]
+    fn zero_height_list_has_no_offset() {
+        assert_eq!(scroll_offset(20, 0, 15, 7), 0);
+    }
+
+    #[test]
+    fn preview_shows_the_end_of_a_long_screen() {
+        let mut p = Preview::blank();
+        p.lines = (0..10).map(|i| i.to_string()).collect();
+        assert_eq!(p.tail(3), ["7", "8", "9"]);
+        assert_eq!(p.tail(0).len(), 0);
+        assert_eq!(p.tail(99).len(), 10);
+    }
 }

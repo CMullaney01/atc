@@ -26,7 +26,6 @@ resizes, and `q` dismisses it:
 ```
 ┌─ atc — 4 session(s), 2 need you ─────────────────────────────┐
 │ ▌● fix-pyright-lint   waiting    4m  myworkspace:0.1  dotfiles/main
-│      └ "Fixed the 3 type errors. Want me to run the tests?"  │
 │  ! coding-standards   blocked   45s  myworkspace:0.2  atc/main
 │  ◐ atc-command-center working    8s  myworkspace:1.0  atc/v1 │
 │  ? add-k9s-dotfiles   unreported  -  myworkspace:1.2  dotfiles
@@ -34,13 +33,22 @@ resizes, and `q` dismisses it:
 │  other panes                                                 │
 │  · nvim               tool           myworkspace:0.0  nvim   │
 │  ◐ cargo              job            myworkspace:2.1  atc/v1 │
+├─ myworkspace:0.1 · dotfiles/main ────────────────────────────┤
+│ > cargo test                                                 │
+│ test result: ok. 42 passed; 0 failed                         │
+│                                                              │
+│ Fixed the 3 type errors. Want me to run the tests?           │
+│ ▌                                                            │
 ├──────────────────────────────────────────────────────────────┤
 │ enter jump  p prompt  x kill  tab other panes  q close       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Most urgent first, so whatever needs you is always the top row. Everything is
-jumpable, so the popup is also how you get back to the `nvim` or `k9s` pane.
+Most urgent first, so whatever needs you is always the top row. The bottom half
+is the live screen of whichever pane is selected, so you can read what a session
+actually said — and answer it with `p` — without going there at all. Everything
+is jumpable too, so the popup is also how you get back to the `nvim` or `k9s`
+pane.
 
 ## States
 

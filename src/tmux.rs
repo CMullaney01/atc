@@ -128,6 +128,25 @@ pub(crate) fn kill_pane(pane: &str) {
     fire(&["kill-pane", "-t", pane]);
 }
 
+/// What is on a pane's screen right now, top line first.
+///
+/// Colour is left out on purpose: the capture is drawn inside a widget that
+/// styles it, and tmux's escapes would fight that.
+pub(crate) fn capture_pane(pane: &str) -> Vec<String> {
+    let raw = run(&["capture-pane", "-p", "-t", pane]).unwrap_or_default();
+    trim_blank_tail(&raw)
+}
+
+/// A pane's screen is padded with blank lines to its full height. Dropping them
+/// lets the caller show the last real line of output at the bottom.
+fn trim_blank_tail(raw: &str) -> Vec<String> {
+    let mut lines: Vec<String> = raw.lines().map(|l| l.trim_end().to_string()).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
 pub(crate) fn focus(pane: &str, session: &str, window_index: u32) {
     fire(&["switch-client", "-t", session]);
     fire(&[
@@ -156,6 +175,18 @@ pub(crate) fn escape_format(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_keeps_blank_lines_inside_but_not_at_the_end() {
+        let got = trim_blank_tail("one\n\ntwo   \n\n\n");
+        assert_eq!(got, vec!["one", "", "two"]);
+    }
+
+    #[test]
+    fn capture_of_an_empty_pane_is_empty() {
+        assert!(trim_blank_tail("\n\n\n").is_empty());
+        assert!(trim_blank_tail("").is_empty());
+    }
 
     #[test]
     fn parses_a_pane_line() {
