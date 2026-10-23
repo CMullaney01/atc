@@ -1,17 +1,31 @@
+//! Works out what is running in a pane when no hook has reported it. Without
+//! this, a session that atc was never told about would be invisible.
 use crate::state::PaneState;
 use crate::tmux::PaneInfo;
 
 /// Long-lived interactive programs. Without this list they would all look like
 /// jobs that never finish.
 const TOOLS: &[&str] = &[
-    "nvim", "vim", "view", "k9s", "tredis", "lazygit", "lazydocker", "htop",
-    "btop", "top", "less", "man", "tig", "ssh",
+    "nvim",
+    "vim",
+    "view",
+    "k9s",
+    "tredis",
+    "lazygit",
+    "lazydocker",
+    "htop",
+    "btop",
+    "top",
+    "less",
+    "man",
+    "tig",
+    "ssh",
 ];
 
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "dash", "ksh"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     /// An AI session with hook state behind it.
     Session,
     /// Looks like an AI session but has never fired a hook, so its state is
@@ -24,11 +38,11 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn is_ai(self) -> bool {
+    pub(crate) fn is_ai(self) -> bool {
         matches!(self, Kind::Session | Kind::Unreported)
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Kind::Session => "session",
             Kind::Unreported => "unreported",
@@ -39,7 +53,7 @@ impl Kind {
     }
 
     /// Only used for panes with no hook state of their own.
-    pub fn glyph(self) -> &'static str {
+    pub(crate) fn glyph(self) -> &'static str {
         match self {
             Kind::Session => "·",
             Kind::Unreported => "?",
@@ -48,7 +62,7 @@ impl Kind {
         }
     }
 
-    pub fn colour(self) -> &'static str {
+    pub(crate) fn colour(self) -> &'static str {
         match self {
             Kind::Session | Kind::Unreported => "colour244",
             Kind::Tool | Kind::Shell => "colour238",
@@ -60,7 +74,10 @@ impl Kind {
 /// tmux reports a bare command name, but be tolerant of paths and the leading
 /// dash a login shell carries.
 fn base_command(cmd: &str) -> &str {
-    cmd.rsplit('/').next().unwrap_or(cmd).trim_start_matches('-')
+    cmd.rsplit('/')
+        .next()
+        .unwrap_or(cmd)
+        .trim_start_matches('-')
 }
 
 /// Claude Code decorates its pane title with "✳".
@@ -76,7 +93,7 @@ fn looks_like_a_version(cmd: &str) -> bool {
     enough && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
-pub fn classify(info: &PaneInfo, state: Option<&PaneState>) -> Kind {
+pub(crate) fn classify(info: &PaneInfo, state: Option<&PaneState>) -> Kind {
     if state.is_some() {
         return Kind::Session;
     }
@@ -127,7 +144,10 @@ mod tests {
             Kind::Unreported
         );
         // Title alone is enough, even when the command looks like a shell.
-        assert_eq!(classify(&pane("✳ Claude Code", "zsh"), None), Kind::Unreported);
+        assert_eq!(
+            classify(&pane("✳ Claude Code", "zsh"), None),
+            Kind::Unreported
+        );
         // Version alone is enough, even with no title.
         assert_eq!(classify(&pane("", "2.1.296"), None), Kind::Unreported);
     }

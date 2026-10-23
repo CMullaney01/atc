@@ -1,3 +1,5 @@
+//! Keeps what each pane is doing in one small file per pane. The status row, the
+//! popup and the hooks all read the same picture, with no daemon to keep running.
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -6,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Status {
+pub(crate) enum Status {
     Idle,
     Working,
     Waiting,
@@ -15,7 +17,7 @@ pub enum Status {
 }
 
 impl Status {
-    pub fn glyph(self) -> &'static str {
+    pub(crate) fn glyph(self) -> &'static str {
         match self {
             Status::Idle => "·",
             Status::Working => "◐",
@@ -25,7 +27,7 @@ impl Status {
         }
     }
 
-    pub fn colour(self) -> &'static str {
+    pub(crate) fn colour(self) -> &'static str {
         match self {
             Status::Idle => "colour244",
             Status::Working => "colour75",
@@ -36,7 +38,7 @@ impl Status {
     }
 
     /// Highest urgency wins when collapsing a window's panes into one glyph.
-    pub fn urgency(self) -> u8 {
+    pub(crate) fn urgency(self) -> u8 {
         match self {
             Status::Idle => 0,
             Status::Working => 1,
@@ -46,7 +48,7 @@ impl Status {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Status::Idle => "idle",
             Status::Working => "working",
@@ -56,7 +58,7 @@ impl Status {
         }
     }
 
-    pub fn parse(s: &str) -> Option<Status> {
+    pub(crate) fn parse(s: &str) -> Option<Status> {
         match s {
             "idle" => Some(Status::Idle),
             "working" => Some(Status::Working),
@@ -69,24 +71,24 @@ impl Status {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PaneState {
-    pub pane_id: String,
-    pub status: Status,
-    pub since: u64,
+pub(crate) struct PaneState {
+    pub(crate) pane_id: String,
+    pub(crate) status: Status,
+    pub(crate) since: u64,
     #[serde(default)]
-    pub stale: bool,
+    pub(crate) stale: bool,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(default)]
-    pub title: Option<String>,
+    pub(crate) title: Option<String>,
     #[serde(default)]
-    pub cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    pub tool: Option<String>,
+    pub(crate) tool: Option<String>,
     #[serde(default)]
-    pub last_message: Option<String>,
+    pub(crate) last_message: Option<String>,
     #[serde(default = "default_source")]
-    pub source: String,
+    pub(crate) source: String,
 }
 
 fn default_source() -> String {
@@ -94,7 +96,7 @@ fn default_source() -> String {
 }
 
 impl PaneState {
-    pub fn new(pane_id: &str) -> Self {
+    pub(crate) fn new(pane_id: &str) -> Self {
         PaneState {
             pane_id: pane_id.to_string(),
             status: Status::Idle,
@@ -109,19 +111,19 @@ impl PaneState {
         }
     }
 
-    pub fn age_secs(&self) -> u64 {
+    pub(crate) fn age_secs(&self) -> u64 {
         now().saturating_sub(self.since)
     }
 }
 
-pub fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-pub fn dir() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     if let Ok(d) = std::env::var("ATC_STATE_DIR") {
         return PathBuf::from(d);
     }
@@ -133,7 +135,13 @@ pub fn dir() -> PathBuf {
 fn file_stem(pane_id: &str) -> String {
     pane_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -141,21 +149,25 @@ fn path_for(pane_id: &str) -> PathBuf {
     dir().join(format!("{}.json", file_stem(pane_id)))
 }
 
-pub fn load(pane_id: &str) -> Option<PaneState> {
+pub(crate) fn load(pane_id: &str) -> Option<PaneState> {
     let raw = fs::read_to_string(path_for(pane_id)).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-pub fn save(st: &PaneState) -> io::Result<()> {
+pub(crate) fn save(st: &PaneState) -> io::Result<()> {
     let d = dir();
     fs::create_dir_all(&d)?;
     let body = serde_json::to_string(st).map_err(io::Error::other)?;
-    let tmp = d.join(format!(".{}.{}.tmp", file_stem(&st.pane_id), std::process::id()));
+    let tmp = d.join(format!(
+        ".{}.{}.tmp",
+        file_stem(&st.pane_id),
+        std::process::id()
+    ));
     fs::write(&tmp, body)?;
     fs::rename(&tmp, path_for(&st.pane_id))
 }
 
-pub fn remove(pane_id: &str) -> io::Result<()> {
+pub(crate) fn remove(pane_id: &str) -> io::Result<()> {
     match fs::remove_file(path_for(pane_id)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -165,7 +177,7 @@ pub fn remove(pane_id: &str) -> io::Result<()> {
 
 /// Removes state for panes tmux no longer reports. SessionEnd covers the
 /// ordinary case; this catches panes killed outright or sessions that crashed.
-pub fn prune(live_pane_ids: &[String]) -> usize {
+pub(crate) fn prune(live_pane_ids: &[String]) -> usize {
     let mut removed = 0;
     for st in all() {
         if !live_pane_ids.contains(&st.pane_id) && remove(&st.pane_id).is_ok() {
@@ -175,7 +187,7 @@ pub fn prune(live_pane_ids: &[String]) -> usize {
     removed
 }
 
-pub fn all() -> Vec<PaneState> {
+pub(crate) fn all() -> Vec<PaneState> {
     let Ok(entries) = fs::read_dir(dir()) else {
         return Vec::new();
     };
@@ -192,6 +204,16 @@ pub fn all() -> Vec<PaneState> {
         }
     }
     out
+}
+
+pub(crate) fn fmt_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 #[cfg(test)]
@@ -243,15 +265,5 @@ mod tests {
     fn pane_id_becomes_a_safe_filename() {
         assert_eq!(file_stem("%6"), "_6");
         assert_eq!(file_stem("../etc/passwd"), "___etc_passwd");
-    }
-}
-
-pub fn fmt_age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
     }
 }

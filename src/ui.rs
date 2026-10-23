@@ -1,8 +1,12 @@
+//! The popup you bring up to see every session at once. It owns the terminal
+//! while it is open, so it puts the screen back before it moves the tmux client.
 use crate::pane::Kind;
 use crate::state::{self, Status};
 use crate::{bar, tmux};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -121,7 +125,7 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, usize) {
     (items, ai_count)
 }
 
-pub fn run() {
+pub(crate) fn run() {
     if let Err(e) = event_loop() {
         eprintln!("atc ui: {e}");
         std::process::exit(1);
@@ -182,7 +186,9 @@ fn event_loop() -> io::Result<()> {
                     },
                     Mode::Browse => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
                         KeyCode::Char('j') | KeyCode::Down => {
                             if visible > 0 {
                                 selected = (selected + 1).min(visible - 1);
@@ -248,7 +254,9 @@ fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
         glyph_style = glyph_style.add_modifier(Modifier::BOLD);
     }
     let mut base = if chosen {
-        Style::default().bg(Color::Indexed(237)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Indexed(237))
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -257,19 +265,33 @@ fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
     }
     Line::from(vec![
         Span::styled(if chosen { " ▌" } else { "  " }, base),
-        Span::styled(if item.active { "▸" } else { " " }, base.fg(Color::Indexed(250))),
+        Span::styled(
+            if item.active { "▸" } else { " " },
+            base.fg(Color::Indexed(250)),
+        ),
         Span::styled(format!("{} ", item.glyph()), glyph_style),
         Span::styled(format!("{:<26} ", crop(&item.title, 26)), base),
-        Span::styled(format!("{:<11} ", item.state_label()), Style::default().fg(item.colour())),
+        Span::styled(
+            format!("{:<11} ", item.state_label()),
+            Style::default().fg(item.colour()),
+        ),
         Span::styled(
             format!(
                 "{:>5}  ",
-                item.age.map(state::fmt_age).unwrap_or_else(|| "-".to_string())
+                item.age
+                    .map(state::fmt_age)
+                    .unwrap_or_else(|| "-".to_string())
             ),
             base.fg(Color::Indexed(244)),
         ),
-        Span::styled(format!("{:<22} ", crop(&item.address, 22)), base.fg(Color::Indexed(250))),
-        Span::styled(item.repo.clone().unwrap_or_default(), base.fg(Color::Indexed(244))),
+        Span::styled(
+            format!("{:<22} ", crop(&item.address, 22)),
+            base.fg(Color::Indexed(250)),
+        ),
+        Span::styled(
+            item.repo.clone().unwrap_or_default(),
+            base.fg(Color::Indexed(244)),
+        ),
     ])
 }
 
@@ -299,7 +321,9 @@ fn draw(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  other panes",
-                Style::default().fg(Color::Indexed(240)).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::Indexed(240))
+                    .add_modifier(Modifier::ITALIC),
             )));
         }
         let chosen = i == selected;
@@ -329,7 +353,12 @@ fn draw(
     let needs_you = items
         .iter()
         .take(ai_count)
-        .filter(|i| matches!(i.status, Some(Status::Waiting | Status::Blocked | Status::Error)))
+        .filter(|i| {
+            matches!(
+                i.status,
+                Some(Status::Waiting | Status::Blocked | Status::Error)
+            )
+        })
         .count();
     let hidden = items.len() - visible;
     let title = if hidden > 0 {
@@ -367,7 +396,10 @@ fn draw(
         Mode::ConfirmKill => Line::from(Span::styled(
             format!(
                 " kill {}?  y / any other key to cancel",
-                items.get(selected).map(|i| i.address.as_str()).unwrap_or("")
+                items
+                    .get(selected)
+                    .map(|i| i.address.as_str())
+                    .unwrap_or("")
             ),
             Style::default().fg(Color::Indexed(196)),
         )),
@@ -382,5 +414,8 @@ fn crop(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    s.chars().take(max.saturating_sub(1)).chain("…".chars()).collect()
+    s.chars()
+        .take(max.saturating_sub(1))
+        .chain("…".chars())
+        .collect()
 }

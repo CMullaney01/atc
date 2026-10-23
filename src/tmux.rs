@@ -1,31 +1,33 @@
+//! The only place that shells out to tmux. Everything else works on the values
+//! this hands back, so the rest of atc can be tested with no tmux server.
 use std::process::Command;
 
 const SEP: char = '\u{1f}';
 
 #[derive(Debug, Clone)]
-pub struct PaneInfo {
-    pub pane_id: String,
-    pub session: String,
-    pub window_index: u32,
-    pub window_name: String,
-    pub pane_index: u32,
-    pub active: bool,
-    pub window_active: bool,
-    pub session_attached: bool,
-    pub title: String,
-    pub command: String,
-    pub path: String,
+pub(crate) struct PaneInfo {
+    pub(crate) pane_id: String,
+    pub(crate) session: String,
+    pub(crate) window_index: u32,
+    pub(crate) window_name: String,
+    pub(crate) pane_index: u32,
+    pub(crate) active: bool,
+    pub(crate) window_active: bool,
+    pub(crate) session_attached: bool,
+    pub(crate) title: String,
+    pub(crate) command: String,
+    pub(crate) path: String,
 }
 
 impl PaneInfo {
-    pub fn address(&self) -> String {
+    pub(crate) fn address(&self) -> String {
         format!("{}.{}", self.window_index, self.pane_index)
     }
 
     /// `pane_active` is per-window, so on its own it is true for one pane in
     /// every window. The pane the user is actually sitting in is the active
     /// pane of the active window of an attached session.
-    pub fn is_current(&self) -> bool {
+    pub(crate) fn is_current(&self) -> bool {
         self.active && self.window_active && self.session_attached
     }
 }
@@ -42,11 +44,11 @@ fn fire(args: &[&str]) {
     let _ = Command::new("tmux").args(args).output();
 }
 
-pub fn available() -> bool {
+pub(crate) fn available() -> bool {
     run(&["-V"]).is_some()
 }
 
-pub fn list_panes() -> Vec<PaneInfo> {
+pub(crate) fn list_panes() -> Vec<PaneInfo> {
     let fmt = format!(
         "#{{pane_id}}{s}#{{session_name}}{s}#{{window_index}}{s}#{{window_name}}{s}\
          #{{pane_index}}{s}#{{?pane_active,1,0}}{s}#{{?window_active,1,0}}{s}\
@@ -80,56 +82,64 @@ fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     })
 }
 
-pub fn current_pane() -> Option<String> {
+pub(crate) fn current_pane() -> Option<String> {
     std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty())
 }
 
-pub fn current_session() -> Option<String> {
+pub(crate) fn current_session() -> Option<String> {
     let out = run(&["display-message", "-p", "#{session_name}"])?;
     let s = out.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Pane options carry per-pane state; a pane-id target with `-w` resolves to
 /// the containing window, which avoids quoting window names.
-pub fn set_pane_option(pane: &str, key: &str, value: &str) {
+pub(crate) fn set_pane_option(pane: &str, key: &str, value: &str) {
     fire(&["set-option", "-p", "-t", pane, key, value]);
 }
 
-pub fn unset_pane_option(pane: &str, key: &str) {
+pub(crate) fn unset_pane_option(pane: &str, key: &str) {
     fire(&["set-option", "-pu", "-t", pane, key]);
 }
 
-pub fn set_window_option(target: &str, key: &str, value: &str) {
+pub(crate) fn set_window_option(target: &str, key: &str, value: &str) {
     fire(&["set-option", "-w", "-t", target, key, value]);
 }
 
-pub fn unset_window_option(target: &str, key: &str) {
+pub(crate) fn unset_window_option(target: &str, key: &str) {
     fire(&["set-option", "-wu", "-t", target, key]);
 }
 
 /// Status lines only redraw on their own interval, so nudge every client to
 /// repaint the moment state changes.
-pub fn refresh_client() {
+pub(crate) fn refresh_client() {
     fire(&["refresh-client", "-S"]);
 }
 
-pub fn send_keys(pane: &str, text: &str) {
+pub(crate) fn send_keys(pane: &str, text: &str) {
     fire(&["send-keys", "-t", pane, text, "Enter"]);
 }
 
-pub fn kill_pane(pane: &str) {
+pub(crate) fn kill_pane(pane: &str) {
     fire(&["kill-pane", "-t", pane]);
 }
 
-pub fn focus(pane: &str, session: &str, window_index: u32) {
+pub(crate) fn focus(pane: &str, session: &str, window_index: u32) {
     fire(&["switch-client", "-t", session]);
-    fire(&["select-window", "-t", &format!("{}:{}", session, window_index)]);
+    fire(&[
+        "select-window",
+        "-t",
+        &format!("{}:{}", session, window_index),
+    ]);
     fire(&["select-pane", "-t", pane]);
 }
 
 /// Claude Code sets the pane title to "✳ <task>"; keep just the task.
-pub fn clean_title(title: &str) -> String {
+pub(crate) fn clean_title(title: &str) -> String {
     title
         .trim()
         .trim_start_matches(|c: char| !c.is_alphanumeric())
@@ -139,7 +149,7 @@ pub fn clean_title(title: &str) -> String {
 
 /// `#[` and `#{` are markup in status formats, so a window called "c#1" would
 /// otherwise corrupt the row.
-pub fn escape_format(s: &str) -> String {
+pub(crate) fn escape_format(s: &str) -> String {
     s.replace('#', "##")
 }
 
@@ -159,7 +169,10 @@ mod tests {
         assert_eq!(p.window_index, 0);
         assert_eq!(p.pane_index, 1);
         assert!(p.active);
-        assert!(p.is_current(), "active pane of an active window in an attached session");
+        assert!(
+            p.is_current(),
+            "active pane of an active window in an attached session"
+        );
         assert_eq!(p.address(), "0.1");
         assert_eq!(p.command, "2.1.308");
         assert_eq!(p.path, "/Users/c/dev/atc");
@@ -183,7 +196,10 @@ mod tests {
 
     #[test]
     fn strips_claude_decoration_from_pane_titles() {
-        assert_eq!(clean_title("✳ fix-pyright-lint-errors"), "fix-pyright-lint-errors");
+        assert_eq!(
+            clean_title("✳ fix-pyright-lint-errors"),
+            "fix-pyright-lint-errors"
+        );
         assert_eq!(clean_title("plain-title"), "plain-title");
         assert_eq!(clean_title(""), "");
     }

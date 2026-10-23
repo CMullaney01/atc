@@ -1,3 +1,5 @@
+//! Every atc subcommand. The hook subcommand is the one that matters: it runs
+//! inside a live coding session, so it must never fail in a way the user sees.
 mod bar;
 mod hook;
 mod pane;
@@ -129,7 +131,11 @@ fn refresh_window_for(pane_id: &str) {
 }
 
 fn cmd_bar(args: &[String]) {
-    let all = args.iter().any(|a| a == "--all");
+    let scope = if args.iter().any(|a| a == "--all") {
+        bar::Scope::Everything
+    } else {
+        bar::Scope::AiOnly
+    };
     let session = args
         .iter()
         .find(|a| !a.starts_with("--") && !a.is_empty())
@@ -138,7 +144,7 @@ fn cmd_bar(args: &[String]) {
     let states = state::all();
     let panes = tmux::list_panes();
     let inv = bar::inventory(&states, &panes);
-    println!("{}", bar::render(&inv, session.as_deref(), all));
+    println!("{}", bar::render(&inv, session.as_deref(), scope));
 }
 
 fn cmd_status(args: &[String]) {
@@ -186,7 +192,9 @@ fn cmd_status(args: &[String]) {
             "{} {:<18} {:<11} {:>5}  {}:{}{}",
             e.glyph(),
             truncate(&e.title(), 18),
-            e.status().map(|s| s.label()).unwrap_or_else(|| e.kind.label()),
+            e.status()
+                .map(|s| s.label())
+                .unwrap_or_else(|| e.kind.label()),
             e.state
                 .map(|s| state::fmt_age(s.age_secs()))
                 .unwrap_or_else(|| "-".to_string()),
@@ -294,9 +302,14 @@ fn cmd_doctor() {
         .map(|h| std::path::PathBuf::from(h).join(".claude/settings.json"))
         .unwrap_or_default();
     match std::fs::read_to_string(&settings) {
-        Ok(body) if body.contains("atc hook") => println!("ok    hooks registered in {}", settings.display()),
+        Ok(body) if body.contains("atc hook") => {
+            println!("ok    hooks registered in {}", settings.display())
+        }
         Ok(_) => {
-            println!("WARN  no 'atc hook' entries in {} — run 'atc install'", settings.display());
+            println!(
+                "WARN  no 'atc hook' entries in {} — run 'atc install'",
+                settings.display()
+            );
             problems += 1;
         }
         Err(e) => {
@@ -416,7 +429,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    s.chars().take(max.saturating_sub(1)).chain("…".chars()).collect()
+    s.chars()
+        .take(max.saturating_sub(1))
+        .chain("…".chars())
+        .collect()
 }
 
 fn log(msg: &str) {
@@ -428,7 +444,11 @@ fn log(msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{} {}", state::now(), msg);
     }
 }
@@ -445,7 +465,10 @@ mod tests {
 
     #[test]
     fn flag_reads_the_following_argument() {
-        let args: Vec<String> = ["--kind", "idle_prompt"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["--kind", "idle_prompt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(flag(&args, "--kind"), Some("idle_prompt"));
         assert_eq!(flag(&args, "--missing"), None);
     }
@@ -455,7 +478,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&hooks_json()).expect("valid JSON");
         let hooks = &v["hooks"];
         assert!(hooks["Stop"].is_array());
-        let notif = hooks["Notification"].as_array().expect("notification array");
+        let notif = hooks["Notification"]
+            .as_array()
+            .expect("notification array");
         assert_eq!(notif.len(), 2);
         let matchers: Vec<&str> = notif.iter().filter_map(|n| n["matcher"].as_str()).collect();
         assert!(matchers.contains(&"permission_prompt"));

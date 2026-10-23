@@ -1,32 +1,38 @@
+//! Decides what one Claude Code hook event means for the pane it came from.
+//! Reads and writes nothing, so the event rules can be tested on their own.
 use crate::state::{self, PaneState, Status};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
-pub struct HookInput {
+pub(crate) struct HookInput {
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(default)]
-    pub cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     #[serde(default)]
-    pub session_title: Option<String>,
+    pub(crate) session_title: Option<String>,
     #[serde(default)]
-    pub tool_name: Option<String>,
+    pub(crate) tool_name: Option<String>,
     #[serde(default)]
-    pub last_assistant_message: Option<String>,
+    pub(crate) last_assistant_message: Option<String>,
     /// Present only when the hook fired inside a subagent.
     #[serde(default)]
-    pub agent_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     Update(PaneState),
     Remove,
     Ignore,
 }
 
 fn first_line(msg: &str) -> String {
-    let line = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = msg
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if line.chars().count() > 200 {
         line.chars().take(199).chain("…".chars()).collect()
     } else {
@@ -38,7 +44,7 @@ fn first_line(msg: &str) -> String {
 ///
 /// `kind` is the Notification matcher, passed as an argument rather than read
 /// from the payload so the mapping never depends on an undocumented field.
-pub fn apply(
+pub(crate) fn apply(
     event: &str,
     kind: Option<&str>,
     input: &HookInput,
@@ -184,28 +190,52 @@ mod tests {
         let mut prev = PaneState::new("%6");
         prev.status = Status::Waiting;
         let before = prev.since;
-        let st = updated(apply("Notification", Some("idle_prompt"), &input(), "%6", Some(prev)));
+        let st = updated(apply(
+            "Notification",
+            Some("idle_prompt"),
+            &input(),
+            "%6",
+            Some(prev),
+        ));
         assert_eq!(st.status, Status::Waiting);
         assert!(st.stale);
-        assert_eq!(st.since, before, "escalation must not reset the age counter");
+        assert_eq!(
+            st.since, before,
+            "escalation must not reset the age counter"
+        );
     }
 
     #[test]
     fn permission_notification_blocks_as_a_fallback() {
-        let st = updated(apply("Notification", Some("permission_prompt"), &input(), "%6", None));
+        let st = updated(apply(
+            "Notification",
+            Some("permission_prompt"),
+            &input(),
+            "%6",
+            None,
+        ));
         assert_eq!(st.status, Status::Blocked);
         assert!(st.stale);
     }
 
     #[test]
     fn session_end_removes_the_pane() {
-        assert_eq!(apply("SessionEnd", None, &input(), "%6", None), Outcome::Remove);
+        assert_eq!(
+            apply("SessionEnd", None, &input(), "%6", None),
+            Outcome::Remove
+        );
     }
 
     #[test]
     fn unknown_events_are_ignored() {
-        assert_eq!(apply("CwdChanged", None, &input(), "%6", None), Outcome::Ignore);
-        assert_eq!(apply("Notification", Some("auth_success"), &input(), "%6", None), Outcome::Ignore);
+        assert_eq!(
+            apply("CwdChanged", None, &input(), "%6", None),
+            Outcome::Ignore
+        );
+        assert_eq!(
+            apply("Notification", Some("auth_success"), &input(), "%6", None),
+            Outcome::Ignore
+        );
     }
 
     #[test]

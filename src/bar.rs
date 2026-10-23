@@ -1,36 +1,38 @@
+//! Builds the fleet row that tmux draws under the window list. tmux asks for it
+//! every couple of seconds, so this only ever formats values it is handed.
 use crate::pane::{self, Kind};
 use crate::state::{PaneState, Status};
 use crate::tmux::{escape_format, PaneInfo};
 use std::collections::{BTreeMap, HashMap};
 
 /// A live tmux pane, with hook state laid over it when there is any.
-pub struct Entry<'a> {
-    pub info: &'a PaneInfo,
-    pub state: Option<&'a PaneState>,
-    pub kind: Kind,
+pub(crate) struct Entry<'a> {
+    pub(crate) info: &'a PaneInfo,
+    pub(crate) state: Option<&'a PaneState>,
+    pub(crate) kind: Kind,
 }
 
 impl Entry<'_> {
-    pub fn status(&self) -> Option<Status> {
+    pub(crate) fn status(&self) -> Option<Status> {
         self.state.map(|s| s.status)
     }
 
-    pub fn stale(&self) -> bool {
+    pub(crate) fn stale(&self) -> bool {
         self.state.is_some_and(|s| s.stale)
     }
 
-    pub fn age_secs(&self) -> u64 {
+    pub(crate) fn age_secs(&self) -> u64 {
         self.state.map(|s| s.age_secs()).unwrap_or(0)
     }
 
-    pub fn glyph(&self) -> &'static str {
+    pub(crate) fn glyph(&self) -> &'static str {
         match self.status() {
             Some(s) => s.glyph(),
             None => self.kind.glyph(),
         }
     }
 
-    pub fn colour(&self) -> &'static str {
+    pub(crate) fn colour(&self) -> &'static str {
         match self.status() {
             Some(s) => s.colour(),
             None => self.kind.colour(),
@@ -39,7 +41,7 @@ impl Entry<'_> {
 
     /// Hooked sessions carry their own title; everything else is better
     /// described by what is actually running in it.
-    pub fn title(&self) -> String {
+    pub(crate) fn title(&self) -> String {
         if !self.kind.is_ai() {
             return if self.info.command.is_empty() {
                 self.info.window_name.clone()
@@ -68,9 +70,8 @@ impl Entry<'_> {
 /// Every pane tmux reports, classified, most urgent first. The pane list is the
 /// source of truth, so panes that never fired a hook still appear and state for
 /// panes that no longer exist cannot produce a ghost.
-pub fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> Vec<Entry<'a>> {
-    let by_id: HashMap<&str, &PaneState> =
-        states.iter().map(|s| (s.pane_id.as_str(), s)).collect();
+pub(crate) fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> Vec<Entry<'a>> {
+    let by_id: HashMap<&str, &PaneState> = states.iter().map(|s| (s.pane_id.as_str(), s)).collect();
     let mut out: Vec<Entry<'a>> = panes
         .iter()
         .map(|info| {
@@ -97,21 +98,29 @@ pub fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> Vec<Entr
     out
 }
 
+/// Other sessions sort after the current one, then by window.
+type GroupKey = (u8, String, u32);
+
 fn styled(glyph: &str, colour: &str, stale: bool) -> String {
     let weight = if stale { ",bold" } else { "" };
     format!("#[fg={colour}{weight}]{glyph}")
 }
 
+/// How much of the workspace the fleet row covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// AI sessions only. The row exists to show which session needs attention,
+    /// and a glyph for every shell would bury that.
+    AiOnly,
+    Everything,
+}
+
 /// The fleet row: one cluster per window, one glyph per pane.
-///
-/// Non-AI panes are left off unless `all` is set — the row exists to show which
-/// AI session needs attention, and a glyph for every shell would bury that.
-pub fn render(entries: &[Entry], current_session: Option<&str>, all: bool) -> String {
-    // (is_other_session, session, window_index) -> (window_name, members)
-    let mut groups: BTreeMap<(u8, String, u32), (String, Vec<(u32, String)>)> = BTreeMap::new();
+pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Scope) -> String {
+    let mut groups: BTreeMap<GroupKey, (String, Vec<(u32, String)>)> = BTreeMap::new();
 
     for e in entries {
-        if !all && !e.kind.is_ai() {
+        if scope == Scope::AiOnly && !e.kind.is_ai() {
             continue;
         }
         let info = e.info;
@@ -128,11 +137,18 @@ pub fn render(entries: &[Entry], current_session: Option<&str>, all: bool) -> St
     let mut prev_session: Option<String> = None;
     for ((is_other, session, window_index), (window_name, mut members)) in groups {
         if let Some(prev) = &prev_session {
-            let gap = if *prev == session { "  " } else { " #[fg=colour238]│#[default] " };
+            let gap = if *prev == session {
+                "  "
+            } else {
+                " #[fg=colour238]│#[default] "
+            };
             out.push_str(gap);
         }
         if is_other == 1 {
-            out.push_str(&format!("#[fg=colour244][{}]#[default] ", escape_format(&session)));
+            out.push_str(&format!(
+                "#[fg=colour244][{}]#[default] ",
+                escape_format(&session)
+            ));
         }
         out.push_str(&format!(
             "#[fg=colour250]{}:{}#[default] ",
@@ -152,7 +168,7 @@ pub fn render(entries: &[Entry], current_session: Option<&str>, all: bool) -> St
 /// The aggregate glyph for one window, used for `@atc_win` on the window
 /// itself. Only panes with real state count: an unreported session has no
 /// urgency to contribute.
-pub fn window_glyph(
+pub(crate) fn window_glyph(
     states: &[PaneState],
     panes: &[PaneInfo],
     session: &str,
@@ -208,7 +224,7 @@ mod tests {
             st("%3", Status::Waiting),
         ];
         let inv = inventory(&states, &panes);
-        let row = render(&inv, Some("ws"), false);
+        let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(row.contains("0:nvim"), "row was: {row}");
         assert!(row.contains("1:claude"));
         let zero = row.split("1:claude").next().unwrap();
@@ -222,7 +238,7 @@ mod tests {
         let states = vec![st("%1", Status::Waiting), st("%99", Status::Blocked)];
         let inv = inventory(&states, &panes);
         assert_eq!(inv.len(), 1, "only live panes appear");
-        let row = render(&inv, Some("ws"), false);
+        let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(!row.contains(Status::Blocked.glyph()), "row was: {row}");
     }
 
@@ -236,7 +252,7 @@ mod tests {
         let states = vec![st("%3", Status::Waiting)];
         let inv = inventory(&states, &panes);
 
-        let row = render(&inv, Some("ws"), false);
+        let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(row.contains(Status::Waiting.glyph()));
         assert_eq!(
             row.matches("colour238").count(),
@@ -244,7 +260,7 @@ mod tests {
             "tool/shell glyphs must not be on the default row: {row}"
         );
 
-        let full = render(&inv, Some("ws"), true);
+        let full = render(&inv, Some("ws"), Scope::Everything);
         assert!(
             full.matches("colour238").count() >= 2,
             "nvim and zsh should both show with --all: {full}"
@@ -258,7 +274,7 @@ mod tests {
         let panes = [p];
         let inv = inventory(&[], &panes);
         assert_eq!(inv[0].kind, Kind::Unreported);
-        let row = render(&inv, Some("ws"), false);
+        let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(row.contains('?'), "row was: {row}");
     }
 
@@ -270,7 +286,7 @@ mod tests {
         ];
         let states = vec![st("%1", Status::Idle), st("%2", Status::Waiting)];
         let inv = inventory(&states, &panes);
-        let row = render(&inv, Some("ws"), false);
+        let row = render(&inv, Some("ws"), Scope::AiOnly);
         let ws_at = row.find("3:claude").expect("current session present");
         let other_at = row.find("[other]").expect("other session present");
         assert!(ws_at < other_at, "current session must come first: {row}");
@@ -278,7 +294,7 @@ mod tests {
 
     #[test]
     fn empty_state_renders_an_empty_row() {
-        assert_eq!(render(&[], Some("ws"), false), "");
+        assert_eq!(render(&[], Some("ws"), Scope::AiOnly), "");
     }
 
     #[test]
@@ -287,7 +303,7 @@ mod tests {
         let mut s = st("%1", Status::Waiting);
         s.stale = true;
         let inv = inventory(std::slice::from_ref(&s), &panes);
-        let row = render(&inv, Some("ws"), false);
+        let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(row.contains("bold"), "row was: {row}");
     }
 
@@ -314,7 +330,11 @@ mod tests {
         p.title = "conormullaney@MacBookPro:~".to_string();
         let panes = [p];
         let inv = inventory(&[], &panes);
-        assert_eq!(inv[0].title(), "nvim", "prefer the command over a shell prompt title");
+        assert_eq!(
+            inv[0].title(),
+            "nvim",
+            "prefer the command over a shell prompt title"
+        );
     }
 
     #[test]
