@@ -72,6 +72,29 @@ impl Status {
     }
 }
 
+/// One agent running underneath a session. Not a pane, so it has no address
+/// and cannot be jumped to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Subagent {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) agent_type: Option<String>,
+    pub(crate) since: u64,
+}
+
+impl Subagent {
+    pub(crate) fn label(&self) -> &str {
+        match self.agent_type.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => "agent",
+        }
+    }
+
+    pub(crate) fn age_secs(&self) -> u64 {
+        now().saturating_sub(self.since)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PaneState {
     pub(crate) pane_id: String,
@@ -91,6 +114,10 @@ pub(crate) struct PaneState {
     pub(crate) last_message: Option<String>,
     #[serde(default = "default_source")]
     pub(crate) source: String,
+    /// Defaulted so that state files written before subagents were tracked
+    /// still load.
+    #[serde(default)]
+    pub(crate) subagents: Vec<Subagent>,
 }
 
 fn default_source() -> String {
@@ -110,6 +137,7 @@ impl PaneState {
             tool: None,
             last_message: None,
             source: default_source(),
+            subagents: Vec::new(),
         }
     }
 
@@ -221,6 +249,14 @@ pub(crate) fn fmt_age(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_state_file_written_before_subagents_still_loads() {
+        let old = r#"{"pane_id":"%6","status":"waiting","since":1,"source":"claude"}"#;
+        let st: PaneState = serde_json::from_str(old).expect("older files must still load");
+        assert_eq!(st.status, Status::Waiting);
+        assert!(st.subagents.is_empty());
+    }
 
     #[test]
     fn urgency_orders_blocked_above_waiting() {

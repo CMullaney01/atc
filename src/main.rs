@@ -2,6 +2,7 @@
 //! inside a live coding session, so it must never fail in a way the user sees.
 mod bar;
 mod hook;
+mod infer;
 mod pane;
 mod state;
 mod tmux;
@@ -59,6 +60,37 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 /// Hooks run on every tool call in every session, so this must never fail in a
 /// way Claude notices: all problems are logged and the exit code stays 0.
+/// Claude Code has been seen to send a raw control character inside a string,
+/// which makes the whole payload invalid JSON. Losing one field is survivable;
+/// losing the message that says what a session wants is not, so a failed parse
+/// is retried against a cleaned copy before giving up.
+fn parse_payload(event: &str, raw: &str) -> HookInput {
+    if raw.trim().is_empty() {
+        return HookInput::default();
+    }
+    match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(first) => {
+            let cleaned: String = raw
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            match serde_json::from_str(&cleaned) {
+                Ok(v) => {
+                    log(&format!(
+                        "hook payload for {event} needed cleaning: {first}"
+                    ));
+                    v
+                }
+                Err(e) => {
+                    log(&format!("unparsable hook payload for {event}: {e}"));
+                    HookInput::default()
+                }
+            }
+        }
+    }
+}
+
 fn cmd_hook(args: &[String]) {
     let Some(event) = args.first() else {
         log("hook called without an event name");
@@ -74,17 +106,7 @@ fn cmd_hook(args: &[String]) {
     if std::io::stdin().read_to_string(&mut raw).is_err() {
         log("could not read hook payload from stdin");
     }
-    let input: HookInput = if raw.trim().is_empty() {
-        HookInput::default()
-    } else {
-        match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                log(&format!("unparsable hook payload for {event}: {e}"));
-                HookInput::default()
-            }
-        }
-    };
+    let input = parse_payload(event, &raw);
 
     let prev = state::load(&pane_id);
     let was = prev.as_ref().map(|p| (p.status, p.stale));
@@ -143,14 +165,16 @@ fn cmd_bar(args: &[String]) {
         .or_else(tmux::current_session);
     let states = state::all();
     let panes = tmux::list_panes();
-    let inv = bar::inventory(&states, &panes);
+    let mut inv = bar::inventory(&states, &panes);
+    infer::decorate(&mut inv);
     println!("{}", bar::render(&inv, session.as_deref(), scope));
 }
 
 fn cmd_status(args: &[String]) {
     let states = state::all();
     let panes = tmux::list_panes();
-    let inv = bar::inventory(&states, &panes);
+    let mut inv = bar::inventory(&states, &panes);
+    infer::decorate(&mut inv);
     let json = args.iter().any(|a| a == "--json");
 
     if json {
@@ -167,6 +191,12 @@ fn cmd_status(args: &[String]) {
                     "kind": e.kind.label(),
                     "command": e.info.command,
                     "status": e.status().map(|s| s.label()),
+                    "inferred": e.is_inferred(),
+                    "source": e.state.map(|s| s.source.clone()),
+                    "subagents": e.subagents().iter().map(|a| serde_json::json!({
+                        "type": a.label(),
+                        "age_secs": a.age_secs(),
+                    })).collect::<Vec<_>>(),
                     "stale": e.stale(),
                     "age_secs": e.state.map(|s| s.age_secs()),
                     "title": e.title(),
@@ -181,47 +211,43 @@ fn cmd_status(args: &[String]) {
         return;
     }
 
-    let (ai, others): (Vec<&bar::Entry>, Vec<&bar::Entry>) =
-        inv.iter().partition(|e| e.kind.is_ai());
-
-    if ai.is_empty() {
+    if inv.iter().all(|e| !e.kind.is_ai()) {
         println!("no AI sessions");
     }
-    for e in &ai {
-        println!(
-            "{} {:<18} {:<11} {:>5}  {}:{}{}",
-            e.glyph(),
-            truncate(&e.title(), 18),
-            e.status()
-                .map(|s| s.label())
-                .unwrap_or_else(|| e.kind.label()),
-            e.state
-                .map(|s| state::fmt_age(s.age_secs()))
-                .unwrap_or_else(|| "-".to_string()),
-            e.info.session,
-            e.info.address(),
-            if e.stale() { "  (stale)" } else { "" },
-        );
-        if let Some(msg) = e.state.and_then(|s| s.last_message.as_ref()) {
-            println!("    {}", truncate(msg, 72));
-        }
-        if let Some(tool) = e.state.and_then(|s| s.tool.as_ref()) {
-            println!("    tool: {tool}");
-        }
-    }
-
-    if !others.is_empty() {
-        println!("\nother panes");
-        for e in &others {
-            println!(
-                "{} {:<18} {:<11} {:>5}  {}:{}",
-                e.glyph(),
-                truncate(&e.title(), 18),
-                e.kind.label(),
-                "",
-                e.info.session,
-                e.info.address(),
-            );
+    for row in bar::tree(&inv, tmux::current_session().as_deref()) {
+        match row {
+            bar::TreeRow::Session(name) => println!("{name}"),
+            bar::TreeRow::Window { index, name } => println!("  {index} {name}"),
+            bar::TreeRow::Pane(i) => {
+                let e = &inv[i];
+                println!(
+                    "    {}{} {:<24} {:<11} {:>5}  {}{}",
+                    e.glyph(),
+                    if e.is_inferred() { "~" } else { " " },
+                    truncate(&e.title(), 24),
+                    e.status()
+                        .map(|s| s.label())
+                        .unwrap_or_else(|| e.kind.label()),
+                    e.state
+                        .map(|s| state::fmt_age(s.age_secs()))
+                        .unwrap_or_else(|| if e.is_inferred() { "~" } else { "-" }.to_string()),
+                    e.info.address(),
+                    if e.stale() { "  (stale)" } else { "" },
+                );
+                for a in e.subagents() {
+                    println!(
+                        "        ⑂ {:<22} {:>5}",
+                        a.label(),
+                        state::fmt_age(a.age_secs())
+                    );
+                }
+                if let Some(tool) = e.state.and_then(|s| s.tool.as_ref()) {
+                    println!("        tool: {tool}");
+                }
+                if let Some(msg) = e.state.and_then(|s| s.last_message.as_ref()) {
+                    println!("        {}", truncate(msg, 68));
+                }
+            }
         }
     }
 }
@@ -400,6 +426,8 @@ fn hooks_json() -> String {
         ("StopFailure", None),
         ("PostToolUseFailure", None),
         ("SessionEnd", None),
+        ("SubagentStart", None),
+        ("SubagentStop", None),
         ("Notification", Some("permission_prompt")),
         ("Notification", Some("idle_prompt")),
     ];

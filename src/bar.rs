@@ -1,7 +1,7 @@
 //! Builds the fleet row that tmux draws under the window list. tmux asks for it
 //! every couple of seconds, so this only ever formats values it is handed.
 use crate::pane::{self, Kind};
-use crate::state::{PaneState, Status};
+use crate::state::{PaneState, Status, Subagent};
 use crate::tmux::{escape_format, PaneInfo};
 use std::collections::{BTreeMap, HashMap};
 
@@ -10,11 +10,24 @@ pub(crate) struct Entry<'a> {
     pub(crate) info: &'a PaneInfo,
     pub(crate) state: Option<&'a PaneState>,
     pub(crate) kind: Kind,
+    /// Worked out from the pane's screen because no hook ever reported it. Only
+    /// ever consulted when there is no real state to use.
+    pub(crate) inferred: Option<Status>,
 }
 
 impl Entry<'_> {
     pub(crate) fn status(&self) -> Option<Status> {
-        self.state.map(|s| s.status)
+        self.state.map(|s| s.status).or(self.inferred)
+    }
+
+    /// True when the status above is a guess off the screen rather than
+    /// something the session said.
+    pub(crate) fn is_inferred(&self) -> bool {
+        self.state.is_none() && self.inferred.is_some()
+    }
+
+    pub(crate) fn subagents(&self) -> &[Subagent] {
+        self.state.map(|s| s.subagents.as_slice()).unwrap_or(&[])
     }
 
     pub(crate) fn stale(&self) -> bool {
@@ -80,6 +93,7 @@ pub(crate) fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> V
                 info,
                 state,
                 kind: pane::classify(info, state),
+                inferred: None,
             }
         })
         .collect();
@@ -111,6 +125,79 @@ const PLAIN: &str = "#[fg=default]";
 const WINDOW: &str = "default";
 const OTHER_SESSION: &str = "colour238";
 const SEPARATOR: &str = "colour240";
+
+/// One line of the workspace as it is actually laid out. Flat rather than
+/// nested so that a caller can walk it straight into rows, and shared so the
+/// popup and `atc status` cannot drift apart.
+pub(crate) enum TreeRow {
+    Session(String),
+    Window { index: u32, name: String },
+    Pane(usize),
+}
+
+/// One window and the panes in it, as indices into the entry list.
+type WindowGroup = (u32, String, Vec<usize>);
+/// One session and its windows.
+type SessionGroup = (String, Vec<WindowGroup>);
+
+/// Groups panes under the window and session they live in.
+///
+/// Sessions lead with the one you are attached to and windows lead with
+/// whatever is most urgent, so the thing that needs you still surfaces — but
+/// panes keep their on-screen order inside a window, so a session always
+/// appears next to whatever it shares a window with.
+pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>) -> Vec<TreeRow> {
+    let mut windows: BTreeMap<(String, u32), (String, Vec<usize>)> = BTreeMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        windows
+            .entry((e.info.session.clone(), e.info.window_index))
+            .or_insert_with(|| (e.info.window_name.clone(), Vec::new()))
+            .1
+            .push(i);
+    }
+
+    let worst = |members: &[usize]| {
+        members
+            .iter()
+            .map(|i| entries[*i].urgency())
+            .max()
+            .unwrap_or(0)
+    };
+
+    let mut by_session: BTreeMap<String, Vec<WindowGroup>> = BTreeMap::new();
+    for ((session, index), (name, mut members)) in windows {
+        members.sort_by_key(|i| entries[*i].info.pane_index);
+        by_session
+            .entry(session)
+            .or_default()
+            .push((index, name, members));
+    }
+
+    let mut sessions: Vec<SessionGroup> = by_session.into_iter().collect();
+    sessions.sort_by(|a, b| {
+        let mine = |name: &str| u8::from(current_session.is_some_and(|c| c == name));
+        mine(&b.0)
+            .cmp(&mine(&a.0))
+            .then(
+                b.1.iter()
+                    .map(|w| worst(&w.2))
+                    .max()
+                    .cmp(&a.1.iter().map(|w| worst(&w.2)).max()),
+            )
+            .then(a.0.cmp(&b.0))
+    });
+
+    let mut out = Vec::new();
+    for (session, mut wins) in sessions {
+        out.push(TreeRow::Session(session));
+        wins.sort_by(|a, b| worst(&b.2).cmp(&worst(&a.2)).then(a.0.cmp(&b.0)));
+        for (index, name, members) in wins {
+            out.push(TreeRow::Window { index, name });
+            out.extend(members.into_iter().map(TreeRow::Pane));
+        }
+    }
+    out
+}
 
 fn styled(glyph: &str, colour: &str, stale: bool) -> String {
     let weight = if stale { ",bold" } else { "" };
@@ -228,6 +315,69 @@ mod tests {
         let mut s = PaneState::new(id);
         s.status = status;
         s
+    }
+
+    #[test]
+    fn the_tree_keeps_a_window_together_and_floats_the_urgent_one_up() {
+        let panes = vec![
+            pane("%1", "ws", 0, "editor", 0, "nvim"),
+            pane("%2", "ws", 0, "editor", 1, "2.1.308"),
+            pane("%3", "ws", 1, "atc", 0, "2.1.308"),
+        ];
+        let states = vec![st("%3", Status::Working), st("%2", Status::Blocked)];
+        let inv = inventory(&states, &panes);
+        let rows = tree(&inv, Some("ws"));
+
+        let shape: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                TreeRow::Session(n) => format!("session {n}"),
+                TreeRow::Window { index, name } => format!("window {index} {name}"),
+                TreeRow::Pane(i) => format!("pane {}", inv[*i].info.pane_id),
+            })
+            .collect();
+
+        assert_eq!(
+            shape,
+            [
+                "session ws",
+                // window 0 holds the blocked pane, so it leads
+                "window 0 editor",
+                "pane %1",
+                "pane %2",
+                "window 1 atc",
+                "pane %3",
+            ],
+            "nvim must stay beside the session it shares window 0 with"
+        );
+    }
+
+    #[test]
+    fn the_attached_session_comes_first_however_quiet_it_is() {
+        let panes = vec![
+            pane("%1", "other", 0, "zsh", 0, "2.1.308"),
+            pane("%2", "mine", 0, "zsh", 0, "2.1.308"),
+        ];
+        let states = vec![st("%1", Status::Blocked), st("%2", Status::Idle)];
+        let inv = inventory(&states, &panes);
+        let rows = tree(&inv, Some("mine"));
+        match &rows[0] {
+            TreeRow::Session(n) => assert_eq!(n, "mine"),
+            _ => panic!("a session heading should lead"),
+        }
+    }
+
+    #[test]
+    fn an_inferred_status_is_used_but_flagged() {
+        let panes = [pane("%1", "ws", 0, "claude", 0, "2.1.308")];
+        let mut inv = inventory(&[], &panes);
+        assert_eq!(inv[0].status(), None);
+        assert!(!inv[0].is_inferred());
+
+        inv[0].inferred = Some(Status::Waiting);
+        assert_eq!(inv[0].status(), Some(Status::Waiting));
+        assert!(inv[0].is_inferred());
+        assert_eq!(inv[0].glyph(), Status::Waiting.glyph());
     }
 
     #[test]
