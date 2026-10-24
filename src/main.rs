@@ -74,6 +74,22 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 /// Hooks run on every tool call in every session, so this must never fail in a
 /// way Claude notices: all problems are logged and the exit code stays 0.
+/// Which agent called, and what its event is called here. `None` when the
+/// agent is unknown, or when it is an event atc has no use for.
+fn resolve(args: &[String], event: &str) -> Option<(Tool, &'static str)> {
+    let tool = match flag(args, "--tool") {
+        Some(name) => match Tool::parse(name) {
+            Some(t) => t,
+            None => {
+                log(&format!("hook called with unknown tool '{name}'"));
+                return None;
+            }
+        },
+        None => Tool::Claude,
+    };
+    Some((tool, tool.normalise(event)?))
+}
+
 /// Claude Code has been seen to send a raw control character inside a string,
 /// which makes the whole payload invalid JSON. Losing one field is survivable;
 /// losing the message that says what a session wants is not, so a failed parse
@@ -111,18 +127,8 @@ fn cmd_hook(args: &[String]) {
         return;
     };
     let kind = flag(args, "--kind");
-    let tool = match flag(args, "--tool") {
-        Some(name) => match Tool::parse(name) {
-            Some(t) => t,
-            None => {
-                log(&format!("hook called with unknown tool '{name}'"));
-                return;
-            }
-        },
-        None => Tool::Claude,
-    };
-    let Some(event) = tool.normalise(event) else {
-        return; // an event this agent has that atc has no use for
+    let Some((tool, event)) = resolve(args, event) else {
+        return;
     };
 
     let Some(pane_id) = tmux::current_pane() else {
@@ -236,80 +242,101 @@ fn cmd_status(args: &[String]) {
     let panes = tmux::list_panes();
     let mut inv = bar::inventory(&states, &panes);
     infer::decorate(&mut inv);
-    let json = args.iter().any(|a| a == "--json");
 
-    if json {
-        let rows: Vec<serde_json::Value> = inv
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "pane_id": e.info.pane_id,
-                    "session": e.info.session,
-                    "window": e.info.window_index,
-                    "pane": e.info.pane_index,
-                    "address": format!("{}:{}", e.info.session, e.info.address()),
-                    "window_name": e.info.window_name,
-                    "kind": e.kind.label(),
-                    "command": e.info.command,
-                    "status": e.status().map(|s| s.label()),
-                    "inferred": e.is_inferred(),
-                    "source": e.state.map(|s| s.source.clone()),
-                    "subagents": e.subagents().iter().map(|a| serde_json::json!({
-                        "type": a.label(),
-                        "age_secs": a.age_secs(),
-                    })).collect::<Vec<_>>(),
-                    "stale": e.stale(),
-                    "age_secs": e.state.map(|s| s.age_secs()),
-                    "title": e.title(),
-                    "cwd": e.state.and_then(|s| s.cwd.clone()).unwrap_or_else(|| e.info.path.clone()),
-                    "tool": e.state.and_then(|s| s.tool.clone()),
-                    "last_message": e.state.and_then(|s| s.last_message.clone()),
-                })
-            })
-            .collect();
-        let doc = serde_json::json!({ "panes": rows });
-        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
-        return;
+    if args.iter().any(|a| a == "--json") {
+        print_status_json(&inv);
+    } else {
+        print_status_tree(&inv);
     }
+}
 
+/// Everything atc knows, for a manager session to reason over.
+fn print_status_json(inv: &[bar::Entry]) {
+    let rows: Vec<serde_json::Value> = inv
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "pane_id": e.info.pane_id,
+                "session": e.info.session,
+                "window": e.info.window_index,
+                "pane": e.info.pane_index,
+                "address": format!("{}:{}", e.info.session, e.info.address()),
+                "window_name": e.info.window_name,
+                "kind": e.kind.label(),
+                "command": e.info.command,
+                "status": e.status().map(|s| s.label()),
+                "inferred": e.is_inferred(),
+                "source": e.state.map(|s| s.source.clone()),
+                "subagents": e.subagents().iter().map(|a| serde_json::json!({
+                    "type": a.label(),
+                    "age_secs": a.age_secs(),
+                })).collect::<Vec<_>>(),
+                "stale": e.stale(),
+                "age_secs": e.state.map(|s| s.age_secs()),
+                "title": e.title(),
+                "cwd": e.state.and_then(|s| s.cwd.clone()).unwrap_or_else(|| e.info.path.clone()),
+                "tool": e.state.and_then(|s| s.tool.clone()),
+                "last_message": e.state.and_then(|s| s.last_message.clone()),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({ "panes": rows });
+    println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+}
+
+/// The same tree the popup draws, for a terminal.
+fn print_status_tree(inv: &[bar::Entry]) {
     if inv.iter().all(|e| !e.kind.is_ai()) {
         println!("no AI sessions");
     }
-    for row in bar::tree(&inv, tmux::current_session().as_deref()) {
+    for row in bar::tree(inv, tmux::current_session().as_deref()) {
         match row {
             bar::TreeRow::Session(name) => println!("{name}"),
             bar::TreeRow::Window { index, name } => println!("  {index} {name}"),
-            bar::TreeRow::Pane(i) => {
-                let e = &inv[i];
-                println!(
-                    "    {}{} {:<24} {:<11} {:>5}  {}{}",
-                    e.glyph(),
-                    if e.is_inferred() { "~" } else { " " },
-                    truncate(&e.title(), 24),
-                    e.status()
-                        .map(|s| s.label())
-                        .unwrap_or_else(|| e.kind.label()),
-                    e.state
-                        .map(|s| state::fmt_age(s.age_secs()))
-                        .unwrap_or_else(|| if e.is_inferred() { "~" } else { "-" }.to_string()),
-                    e.info.address(),
-                    if e.stale() { "  (stale)" } else { "" },
-                );
-                for a in e.subagents() {
-                    println!(
-                        "        ⑂ {:<22} {:>5}",
-                        a.label(),
-                        state::fmt_age(a.age_secs())
-                    );
-                }
-                if let Some(tool) = e.state.and_then(|s| s.tool.as_ref()) {
-                    println!("        tool: {tool}");
-                }
-                if let Some(msg) = e.state.and_then(|s| s.last_message.as_ref()) {
-                    println!("        {}", truncate(msg, 68));
-                }
-            }
+            bar::TreeRow::Pane(i) => print_status_pane(&inv[i]),
         }
+    }
+}
+
+/// One pane, with whatever detail it has under it.
+fn print_status_pane(e: &bar::Entry) {
+    println!(
+        "    {}{} {:<24} {:<11} {:>5}  {}{}",
+        e.glyph(),
+        if e.is_inferred() {
+            bar::INFERRED_MARK
+        } else {
+            " "
+        },
+        truncate(&e.title(), 24),
+        e.status()
+            .map(|s| s.label())
+            .unwrap_or_else(|| e.kind.label()),
+        e.state
+            .map(|s| state::fmt_age(s.age_secs()))
+            .unwrap_or_else(|| {
+                if e.is_inferred() {
+                    bar::INFERRED_MARK
+                } else {
+                    "-"
+                }
+                .to_string()
+            }),
+        e.info.address(),
+        if e.stale() { "  (stale)" } else { "" },
+    );
+    for a in e.subagents() {
+        println!(
+            "        ⑂ {:<22} {:>5}",
+            a.label(),
+            state::fmt_age(a.age_secs())
+        );
+    }
+    if let Some(tool) = e.state.and_then(|s| s.tool.as_ref()) {
+        println!("        tool: {tool}");
+    }
+    if let Some(msg) = e.state.and_then(|s| s.last_message.as_ref()) {
+        println!("        {}", truncate(msg, 68));
     }
 }
 
@@ -366,56 +393,75 @@ fn cmd_seen(args: &[String]) {
 }
 
 fn cmd_doctor() {
-    let mut problems = 0;
+    let problems = check_tmux() + check_state_dir() + check_hooks();
 
-    match tmux::available() {
-        true => println!("ok    tmux found"),
-        false => {
-            println!("FAIL  tmux not on PATH");
-            problems += 1;
-        }
+    match tmux::current_pane() {
+        Some(p) => println!("ok    running inside tmux pane {p}"),
+        None => println!("WARN  not inside tmux, so panes cannot be identified"),
     }
+    println!("ok    {} tracked pane(s)", state::all().len());
+    report_screen_confidence();
 
+    if problems > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Each check prints its own line and returns how many problems it found, so
+/// doctor reads as the list of checks it runs.
+fn check_tmux() -> u32 {
+    if tmux::available() {
+        println!("ok    tmux found");
+        return 0;
+    }
+    println!("FAIL  tmux not on PATH");
+    1
+}
+
+fn check_state_dir() -> u32 {
     let dir = state::dir();
     match std::fs::create_dir_all(&dir) {
-        Ok(()) => println!("ok    state dir {}", dir.display()),
+        Ok(()) => {
+            println!("ok    state dir {}", dir.display());
+            0
+        }
         Err(e) => {
             println!("FAIL  state dir {}: {e}", dir.display());
-            problems += 1;
+            1
         }
     }
+}
 
+/// Only Claude's settings file is checked. The other three keep their hooks
+/// elsewhere and in their own formats, and a missing one is not a problem
+/// unless you use that agent.
+fn check_hooks() -> u32 {
     let settings = std::env::var("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".claude/settings.json"))
         .unwrap_or_default();
     match std::fs::read_to_string(&settings) {
         Ok(body) if body.contains("atc hook") => {
-            println!("ok    hooks registered in {}", settings.display())
+            println!("ok    hooks registered in {}", settings.display());
+            0
         }
         Ok(_) => {
             println!(
                 "WARN  no 'atc hook' entries in {} — run 'atc install'",
                 settings.display()
             );
-            problems += 1;
+            1
         }
         Err(e) => {
             println!("WARN  cannot read {}: {e}", settings.display());
-            problems += 1;
+            1
         }
     }
+}
 
-    match tmux::current_pane() {
-        Some(p) => println!("ok    running inside tmux pane {p}"),
-        None => println!("WARN  not inside tmux, so panes cannot be identified"),
-    }
-
-    let tracked = state::all().len();
-    println!("ok    {tracked} tracked pane(s)");
-
-    // Screen reading is a fallback for sessions that never fired a hook, and
-    // how much to trust it differs per agent. Say so rather than let a guess
-    // look like a report.
+/// Screen reading is a fallback for sessions that never fired a hook, and how
+/// much to trust it differs per agent. Say so rather than let a guess look
+/// like a report.
+fn report_screen_confidence() {
     for tool in Tool::ALL {
         let note = match tool.markers().confidence {
             agent::Confidence::Seen => "screen rules checked against a live session",
@@ -423,10 +469,6 @@ fn cmd_doctor() {
             agent::Confidence::None => "no screen rules — relies on its hooks alone",
         };
         println!("      {:<8} {note}", tool.id());
-    }
-
-    if problems > 0 {
-        std::process::exit(1);
     }
 }
 
