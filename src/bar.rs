@@ -101,6 +101,17 @@ pub(crate) fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> V
 /// Other sessions sort after the current one, then by window.
 type GroupKey = (u8, String, u32);
 
+/// Back to the row's own colours. Not `#[default]`: inside a status line that
+/// means the status bar's style, which drags the row back onto whatever the bar
+/// is painted with halfway through drawing it.
+const PLAIN: &str = "#[bg=terminal,fg=terminal]";
+
+/// Context, in descending order of how much it should draw the eye. The glyphs
+/// carry the state, so nothing structural competes with them for attention.
+const WINDOW: &str = "colour245";
+const OTHER_SESSION: &str = "colour240";
+const SEPARATOR: &str = "colour238";
+
 fn styled(glyph: &str, colour: &str, stale: bool) -> String {
     let weight = if stale { ",bold" } else { "" };
     format!("#[fg={colour}{weight}]{glyph}")
@@ -138,20 +149,20 @@ pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Sc
     for ((is_other, session, window_index), (window_name, mut members)) in groups {
         if let Some(prev) = &prev_session {
             let gap = if *prev == session {
-                "  "
+                "  ".to_string()
             } else {
-                " #[fg=colour238]│#[default] "
+                format!(" #[fg={SEPARATOR}]│{PLAIN} ")
             };
-            out.push_str(gap);
+            out.push_str(&gap);
         }
         if is_other == 1 {
             out.push_str(&format!(
-                "#[fg=colour244][{}]#[default] ",
+                "#[fg={OTHER_SESSION}][{}]{PLAIN} ",
                 escape_format(&session)
             ));
         }
         out.push_str(&format!(
-            "#[fg=colour250]{}:{}#[default] ",
+            "#[fg={WINDOW}]{}:{}{PLAIN} ",
             window_index,
             escape_format(&window_name)
         ));
@@ -159,7 +170,7 @@ pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Sc
         for (_, glyph) in &members {
             out.push_str(glyph);
         }
-        out.push_str("#[default]");
+        out.push_str(PLAIN);
         prev_session = Some(session);
     }
     out
@@ -263,14 +274,14 @@ mod tests {
         let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(row.contains(Status::Waiting.glyph()));
         assert_eq!(
-            row.matches("colour238").count(),
+            row.matches(SEPARATOR).count(),
             0,
             "tool/shell glyphs must not be on the default row: {row}"
         );
 
         let full = render(&inv, Some("ws"), Scope::Everything);
         assert!(
-            full.matches("colour238").count() >= 2,
+            full.matches(SEPARATOR).count() >= 2,
             "nvim and zsh should both show with --all: {full}"
         );
     }
