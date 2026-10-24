@@ -101,16 +101,16 @@ pub(crate) fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> V
 /// Other sessions sort after the current one, then by window.
 type GroupKey = (u8, String, u32);
 
-/// Back to the row's own colours. Not `#[default]`: inside a status line that
-/// means the status bar's style, which drags the row back onto whatever the bar
-/// is painted with halfway through drawing it.
-const PLAIN: &str = "#[bg=terminal,fg=terminal]";
+/// Back to the status bar's own text colour, leaving its background alone.
+/// Only the foreground is reset, so the row stays part of the bar.
+const PLAIN: &str = "#[fg=default]";
 
-/// Context, in descending order of how much it should draw the eye. The glyphs
-/// carry the state, so nothing structural competes with them for attention.
-const WINDOW: &str = "colour245";
-const OTHER_SESSION: &str = "colour240";
-const SEPARATOR: &str = "colour238";
+/// Context, in descending order of how much it should draw the eye. These sit
+/// on the status bar, which is light by default, so they run dark; the glyphs
+/// carry the state and nothing structural competes with them.
+const WINDOW: &str = "default";
+const OTHER_SESSION: &str = "colour238";
+const SEPARATOR: &str = "colour240";
 
 fn styled(glyph: &str, colour: &str, stale: bool) -> String {
     let weight = if stale { ",bold" } else { "" };
@@ -271,17 +271,18 @@ mod tests {
         let states = vec![st("%3", Status::Waiting)];
         let inv = inventory(&states, &panes);
 
+        let quiet = Kind::Tool.colour();
         let row = render(&inv, Some("ws"), Scope::AiOnly);
         assert!(row.contains(Status::Waiting.glyph()));
         assert_eq!(
-            row.matches(SEPARATOR).count(),
+            row.matches(quiet).count(),
             0,
             "tool/shell glyphs must not be on the default row: {row}"
         );
 
         let full = render(&inv, Some("ws"), Scope::Everything);
         assert!(
-            full.matches(SEPARATOR).count() >= 2,
+            full.matches(quiet).count() >= 2,
             "nvim and zsh should both show with --all: {full}"
         );
     }

@@ -64,9 +64,9 @@ impl Kind {
 
     pub(crate) fn colour(self) -> &'static str {
         match self {
-            Kind::Session | Kind::Unreported => "colour244",
-            Kind::Tool | Kind::Shell => "colour238",
-            Kind::Job => "colour244",
+            Kind::Session | Kind::Unreported => "colour239",
+            Kind::Tool | Kind::Shell => "colour242",
+            Kind::Job => "colour19",
         }
     }
 }
