@@ -1,10 +1,11 @@
-//! The popup you bring up to see every session at once, with a live view of
-//! whichever one is selected so you can read it without going there. It owns the
-//! terminal while it is open, so it puts the screen back before it moves the
-//! tmux client.
+//! The popup you bring up to see every session at once, laid out the way your
+//! tmux actually is, with a live view of whichever one is selected so you can
+//! read it without going there. It owns the terminal while it is open, so it
+//! puts the screen back before it moves the tmux client.
+use crate::bar::TreeRow;
 use crate::pane::Kind;
-use crate::state::{self, Status};
-use crate::{bar, tmux};
+use crate::state::{self, Status, Subagent};
+use crate::{bar, infer, tmux};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -34,6 +35,8 @@ struct Item {
     age: Option<u64>,
     repo: Option<String>,
     active: bool,
+    inferred: bool,
+    subagents: Vec<Subagent>,
 }
 
 impl Item {
@@ -64,12 +67,29 @@ impl Item {
             None => self.kind.label(),
         }
     }
+
+    fn age_label(&self) -> String {
+        match self.age {
+            Some(secs) => state::fmt_age(secs),
+            None if self.inferred => "~".to_string(),
+            None => "-".to_string(),
+        }
+    }
 }
 
 enum Mode {
     Browse,
     Prompt(String),
     ConfirmKill,
+}
+
+/// One drawn line. Only `Pane` can be selected — the rest are structure, and a
+/// subagent is not a pane, so jumping to or killing one means nothing.
+enum Row {
+    Session(String),
+    Window { index: u32, name: String },
+    Pane(usize),
+    Subagent { parent: usize, agent: usize },
 }
 
 /// The screen of one pane, kept between frames so every redraw does not shell
@@ -111,28 +131,71 @@ impl Preview {
     }
 }
 
-/// One drawn line of the list: either a section heading or one pane.
-enum Row {
-    Heading(&'static str),
-    Pane(usize),
-}
-
-/// Inventory is sorted AI-first, so the heading goes in front of the first
-/// non-AI pane and nowhere else.
-fn rows(ai_count: usize, visible: usize) -> Vec<Row> {
-    let mut out = Vec::with_capacity(visible + 1);
-    for i in 0..visible {
-        if i == ai_count {
-            out.push(Row::Heading("other panes"));
+/// Turns the workspace order into drawn lines, dropping panes that are not AI
+/// sessions when they are hidden, along with any window or session left empty.
+fn build_rows(items: &[Item], order: &[TreeRow], show_others: bool) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::new();
+    for row in order {
+        match row {
+            TreeRow::Session(name) => {
+                drop_empty_session(&mut out);
+                out.push(Row::Session(name.clone()));
+            }
+            TreeRow::Window { index, name } => {
+                drop_empty_window(&mut out);
+                out.push(Row::Window {
+                    index: *index,
+                    name: name.clone(),
+                });
+            }
+            TreeRow::Pane(i) => {
+                let item = &items[*i];
+                if !show_others && !item.kind.is_ai() {
+                    continue;
+                }
+                out.push(Row::Pane(*i));
+                for agent in 0..item.subagents.len() {
+                    out.push(Row::Subagent { parent: *i, agent });
+                }
+            }
         }
-        out.push(Row::Pane(i));
     }
+    drop_empty_session(&mut out);
     out
 }
 
-/// The chosen pane sits one row lower once the heading is on screen above it.
-fn row_of(selected: usize, ai_count: usize, visible: usize) -> usize {
-    selected + usize::from(ai_count < visible && selected >= ai_count)
+/// A window heading that gained no panes under it should not be drawn.
+fn drop_empty_window(out: &mut Vec<Row>) {
+    if matches!(out.last(), Some(Row::Window { .. })) {
+        out.pop();
+    }
+}
+
+/// Nor should a session heading that gained no windows.
+fn drop_empty_session(out: &mut Vec<Row>) {
+    drop_empty_window(out);
+    if matches!(out.last(), Some(Row::Session(_))) {
+        out.pop();
+    }
+}
+
+/// The item indices that can be selected, in the order they are drawn.
+fn selectable(rows: &[Row]) -> Vec<usize> {
+    rows.iter()
+        .filter_map(|r| match r {
+            Row::Pane(i) => Some(*i),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Which drawn line the cursor is sitting on, so the viewport can keep it in
+/// view regardless of how much structure is above it.
+fn row_of(rows: &[Row], item: Option<usize>) -> usize {
+    let Some(item) = item else { return 0 };
+    rows.iter()
+        .position(|r| matches!(r, Row::Pane(i) if *i == item))
+        .unwrap_or(0)
 }
 
 /// Scroll only when the chosen row would otherwise fall off an edge, so the
@@ -174,12 +237,12 @@ fn repo_label(cwd: &str, cache: &mut HashMap<String, Option<String>>) -> Option<
     label
 }
 
-/// Inventory is already sorted AI-first, so the AI section is a prefix of this
-/// list and hiding the rest is just a shorter slice.
-fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, usize) {
+fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, Vec<TreeRow>, usize) {
     let states = state::all();
     let panes = tmux::list_panes();
-    let inv = bar::inventory(&states, &panes);
+    let mut inv = bar::inventory(&states, &panes);
+    infer::decorate(&mut inv);
+    let order = bar::tree(&inv, tmux::current_session().as_deref());
     let ai_count = inv.iter().filter(|e| e.kind.is_ai()).count();
     let items = inv
         .iter()
@@ -200,9 +263,11 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, usize) {
                 cache,
             ),
             active: e.info.is_current(),
+            inferred: e.is_inferred(),
+            subagents: e.subagents().to_vec(),
         })
         .collect();
-    (items, ai_count)
+    (items, order, ai_count)
 }
 
 pub(crate) fn run() {
@@ -219,8 +284,8 @@ fn event_loop() -> io::Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let mut cache: HashMap<String, Option<String>> = HashMap::new();
-    let (mut items, mut ai_count) = snapshot(&mut cache);
-    let mut selected: usize = 0;
+    let (mut items, mut order, mut ai_count) = snapshot(&mut cache);
+    let mut cursor: usize = 0;
     let mut offset: usize = 0;
     let mut show_others = true;
     let mut mode = Mode::Browse;
@@ -229,16 +294,19 @@ fn event_loop() -> io::Result<()> {
     let mut jump: Option<(String, String, u32)> = None;
 
     loop {
-        let visible = if show_others { items.len() } else { ai_count };
-        selected = selected.min(visible.saturating_sub(1));
-        preview.follow(items.get(selected).map(|i| i.pane_id.as_str()));
+        let rows = build_rows(&items, &order, show_others);
+        let pick = selectable(&rows);
+        cursor = cursor.min(pick.len().saturating_sub(1));
+        let chosen = pick.get(cursor).copied();
+        preview.follow(chosen.map(|i| items[i].pane_id.as_str()));
 
         terminal.draw(|f| {
             let view = View {
                 items: &items,
+                rows: &rows,
+                chosen,
                 ai_count,
-                visible,
-                selected,
+                hidden: items.len() - pick.len(),
                 mode: &mode,
                 preview: &preview,
             };
@@ -254,7 +322,7 @@ fn event_loop() -> io::Result<()> {
                     Mode::Prompt(buf) => match key.code {
                         KeyCode::Esc => mode = Mode::Browse,
                         KeyCode::Enter => {
-                            if let Some(item) = items.get(selected) {
+                            if let Some(item) = chosen.map(|i| &items[i]) {
                                 if !buf.is_empty() {
                                     tmux::send_keys(&item.pane_id, buf);
                                 }
@@ -269,11 +337,11 @@ fn event_loop() -> io::Result<()> {
                     },
                     Mode::ConfirmKill => match key.code {
                         KeyCode::Char('y') => {
-                            if let Some(item) = items.get(selected) {
+                            if let Some(item) = chosen.map(|i| &items[i]) {
                                 tmux::kill_pane(&item.pane_id);
                                 let _ = state::remove(&item.pane_id);
                             }
-                            (items, ai_count) = snapshot(&mut cache);
+                            (items, order, ai_count) = snapshot(&mut cache);
                             mode = Mode::Browse;
                         }
                         _ => mode = Mode::Browse,
@@ -284,33 +352,33 @@ fn event_loop() -> io::Result<()> {
                             break
                         }
                         KeyCode::Char('j') | KeyCode::Down => {
-                            if visible > 0 {
-                                selected = (selected + 1).min(visible - 1);
+                            if !pick.is_empty() {
+                                cursor = (cursor + 1).min(pick.len() - 1);
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            selected = selected.saturating_sub(1);
+                            cursor = cursor.saturating_sub(1);
                         }
-                        KeyCode::Char('g') => selected = 0,
-                        KeyCode::Char('G') => selected = visible.saturating_sub(1),
+                        KeyCode::Char('g') => cursor = 0,
+                        KeyCode::Char('G') => cursor = pick.len().saturating_sub(1),
                         KeyCode::Tab => show_others = !show_others,
                         KeyCode::Char('r') => {
                             cache.clear();
-                            (items, ai_count) = snapshot(&mut cache);
+                            (items, order, ai_count) = snapshot(&mut cache);
                         }
                         KeyCode::Char('p') => {
                             // Only an AI session can take a prompt.
-                            if items.get(selected).is_some_and(|i| i.kind.is_ai()) {
+                            if chosen.is_some_and(|i| items[i].kind.is_ai()) {
                                 mode = Mode::Prompt(String::new());
                             }
                         }
                         KeyCode::Char('x') => {
-                            if !items.is_empty() {
+                            if chosen.is_some() {
                                 mode = Mode::ConfirmKill;
                             }
                         }
                         KeyCode::Enter => {
-                            if let Some(item) = items.get(selected) {
+                            if let Some(item) = chosen.map(|i| &items[i]) {
                                 jump = Some((
                                     item.pane_id.clone(),
                                     item.session.clone(),
@@ -326,7 +394,7 @@ fn event_loop() -> io::Result<()> {
         }
 
         if last_refresh.elapsed() > Duration::from_secs(1) {
-            (items, ai_count) = snapshot(&mut cache);
+            (items, order, ai_count) = snapshot(&mut cache);
             last_refresh = Instant::now();
         }
     }
@@ -342,7 +410,8 @@ fn event_loop() -> io::Result<()> {
     Ok(())
 }
 
-fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
+fn item_line(item: &Item, chosen: bool) -> Line<'static> {
+    let dim = !item.kind.is_ai();
     let mut glyph_style = Style::default().fg(item.colour());
     if item.stale {
         glyph_style = glyph_style.add_modifier(Modifier::BOLD);
@@ -358,29 +427,24 @@ fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
         base = base.fg(Color::Indexed(243));
     }
     Line::from(vec![
-        Span::styled(if chosen { " ▌" } else { "  " }, base),
+        Span::styled(if chosen { "  ▌" } else { "   " }, base),
         Span::styled(
             if item.active { "▸" } else { " " },
             base.fg(Color::Indexed(250)),
         ),
-        Span::styled(format!("{} ", item.glyph()), glyph_style),
-        Span::styled(format!("{:<26} ", crop(&item.title, 26)), base),
+        Span::styled(item.glyph(), glyph_style),
+        Span::styled(
+            if item.inferred { "~ " } else { "  " },
+            base.fg(Color::Indexed(244)),
+        ),
+        Span::styled(format!("{:<24} ", crop(&item.title, 24)), base),
         Span::styled(
             format!("{:<11} ", item.state_label()),
             Style::default().fg(item.colour()),
         ),
         Span::styled(
-            format!(
-                "{:>5}  ",
-                item.age
-                    .map(state::fmt_age)
-                    .unwrap_or_else(|| "-".to_string())
-            ),
+            format!("{:>5}  ", item.age_label()),
             base.fg(Color::Indexed(244)),
-        ),
-        Span::styled(
-            format!("{:<22} ", crop(&item.address, 22)),
-            base.fg(Color::Indexed(250)),
         ),
         Span::styled(
             item.repo.clone().unwrap_or_default(),
@@ -389,11 +453,27 @@ fn item_line(item: &Item, chosen: bool, dim: bool) -> Line<'static> {
     ])
 }
 
+fn subagent_line(agent: &Subagent) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("         "),
+        Span::styled("⑂ ", Style::default().fg(Color::Indexed(109))),
+        Span::styled(
+            format!("{:<22} ", crop(agent.label(), 22)),
+            Style::default().fg(Color::Indexed(109)),
+        ),
+        Span::styled(
+            format!("{:>5}", state::fmt_age(agent.age_secs())),
+            Style::default().fg(Color::Indexed(244)),
+        ),
+    ])
+}
+
 struct View<'a> {
     items: &'a [Item],
+    rows: &'a [Row],
+    chosen: Option<usize>,
     ai_count: usize,
-    visible: usize,
-    selected: usize,
+    hidden: usize,
     mode: &'a Mode,
     preview: &'a Preview,
 }
@@ -410,15 +490,9 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(outer[0]);
 
-    let all_rows = rows(v.ai_count, v.visible);
     let empty_notice = usize::from(v.ai_count == 0);
     let list_height = usize::from(split[0].height.saturating_sub(2)).saturating_sub(empty_notice);
-    let offset = scroll_offset(
-        all_rows.len(),
-        list_height,
-        row_of(v.selected, v.ai_count, v.visible),
-        offset,
-    );
+    let offset = scroll_offset(v.rows.len(), list_height, row_of(v.rows, v.chosen), offset);
 
     let mut lines: Vec<Line> = Vec::new();
     if v.ai_count == 0 {
@@ -427,37 +501,38 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
             Style::default().fg(Color::Indexed(244)),
         )));
     }
-    for row in all_rows.iter().skip(offset).take(list_height) {
-        match row {
-            Row::Heading(text) => lines.push(Line::from(Span::styled(
-                format!("  {text}"),
+    for row in v.rows.iter().skip(offset).take(list_height) {
+        lines.push(match row {
+            Row::Session(name) => Line::from(Span::styled(
+                format!(" {name}"),
                 Style::default()
-                    .fg(Color::Indexed(240))
-                    .add_modifier(Modifier::ITALIC),
-            ))),
-            Row::Pane(i) => {
-                let item = &v.items[*i];
-                lines.push(item_line(item, *i == v.selected, *i >= v.ai_count));
-            }
-        }
+                    .fg(Color::Indexed(250))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Row::Window { index, name } => Line::from(Span::styled(
+                format!("   {index} {name}"),
+                Style::default().fg(Color::Indexed(240)),
+            )),
+            Row::Pane(i) => item_line(&v.items[*i], v.chosen == Some(*i)),
+            Row::Subagent { parent, agent } => subagent_line(&v.items[*parent].subagents[*agent]),
+        });
     }
 
     let needs_you = v
         .items
         .iter()
-        .take(v.ai_count)
         .filter(|i| {
-            matches!(
-                i.status,
-                Some(Status::Waiting | Status::Blocked | Status::Error)
-            )
+            i.kind.is_ai()
+                && matches!(
+                    i.status,
+                    Some(Status::Waiting | Status::Blocked | Status::Error)
+                )
         })
         .count();
-    let hidden = v.items.len() - v.visible;
-    let title = if hidden > 0 {
+    let title = if v.hidden > 0 {
         format!(
-            " atc — {} session(s), {needs_you} need you, {hidden} pane(s) hidden ",
-            v.ai_count
+            " atc — {} session(s), {needs_you} need you, {} pane(s) hidden ",
+            v.ai_count, v.hidden
         )
     } else {
         format!(" atc — {} session(s), {needs_you} need you ", v.ai_count)
@@ -473,7 +548,7 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
 }
 
 fn draw_preview(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
-    let chosen = v.items.get(v.selected);
+    let chosen = v.chosen.map(|i| &v.items[i]);
     let title = match chosen {
         Some(item) => match &item.repo {
             Some(repo) => format!(" {} · {repo} ", item.address),
@@ -525,10 +600,7 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
         Mode::ConfirmKill => Line::from(Span::styled(
             format!(
                 " kill {}?  y / any other key to cancel",
-                v.items
-                    .get(v.selected)
-                    .map(|i| i.address.as_str())
-                    .unwrap_or("")
+                v.chosen.map(|i| v.items[i].address.as_str()).unwrap_or("")
             ),
             Style::default().fg(Color::Indexed(196)),
         )),
@@ -553,29 +625,84 @@ fn crop(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn heading_goes_in_front_of_the_first_non_ai_pane() {
-        let laid_out: Vec<String> = rows(2, 4)
-            .iter()
-            .map(|r| match r {
-                Row::Heading(t) => (*t).to_string(),
-                Row::Pane(i) => i.to_string(),
-            })
-            .collect();
-        assert_eq!(laid_out, ["0", "1", "other panes", "2", "3"]);
+    fn item(title: &str, kind: Kind, agents: usize) -> Item {
+        Item {
+            pane_id: format!("%{title}"),
+            session: "ws".to_string(),
+            window_index: 0,
+            address: "ws:0.0".to_string(),
+            title: title.to_string(),
+            kind,
+            status: None,
+            stale: false,
+            age: None,
+            repo: None,
+            active: false,
+            inferred: false,
+            subagents: (0..agents)
+                .map(|i| Subagent {
+                    id: format!("a{i}"),
+                    agent_type: Some("Explore".to_string()),
+                    since: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn order() -> Vec<TreeRow> {
+        vec![
+            TreeRow::Session("ws".to_string()),
+            TreeRow::Window {
+                index: 0,
+                name: "editor".to_string(),
+            },
+            TreeRow::Pane(0),
+            TreeRow::Pane(1),
+        ]
     }
 
     #[test]
-    fn no_heading_when_the_other_panes_are_hidden() {
-        assert_eq!(rows(2, 2).len(), 2);
+    fn subagents_are_drawn_under_their_pane_but_never_selectable() {
+        let items = vec![
+            item("claude", Kind::Session, 2),
+            item("zsh", Kind::Shell, 0),
+        ];
+        let rows = build_rows(&items, &order(), true);
+        assert!(matches!(rows[2], Row::Pane(0)));
+        assert!(matches!(rows[3], Row::Subagent { parent: 0, .. }));
+        assert!(matches!(rows[4], Row::Subagent { parent: 0, .. }));
+        assert!(matches!(rows[5], Row::Pane(1)));
+        assert_eq!(selectable(&rows), vec![0, 1]);
     }
 
     #[test]
-    fn chosen_row_accounts_for_the_heading_above_it() {
-        assert_eq!(row_of(1, 2, 4), 1);
-        assert_eq!(row_of(2, 2, 4), 3);
-        assert_eq!(row_of(1, 2, 2), 1);
-        assert_eq!(row_of(0, 0, 3), 1);
+    fn hiding_other_panes_drops_the_window_it_empties() {
+        let items = vec![item("nvim", Kind::Tool, 0)];
+        let only = vec![
+            TreeRow::Session("ws".to_string()),
+            TreeRow::Window {
+                index: 0,
+                name: "editor".to_string(),
+            },
+            TreeRow::Pane(0),
+        ];
+        assert_eq!(build_rows(&items, &only, true).len(), 3);
+        assert!(
+            build_rows(&items, &only, false).is_empty(),
+            "a session with nothing left in it should not be drawn"
+        );
+    }
+
+    #[test]
+    fn the_cursor_row_accounts_for_structure_and_subagents() {
+        let items = vec![
+            item("claude", Kind::Session, 2),
+            item("zsh", Kind::Shell, 0),
+        ];
+        let rows = build_rows(&items, &order(), true);
+        assert_eq!(row_of(&rows, Some(0)), 2);
+        assert_eq!(row_of(&rows, Some(1)), 5);
+        assert_eq!(row_of(&rows, None), 0);
     }
 
     #[test]
@@ -608,5 +735,14 @@ mod tests {
         assert_eq!(p.tail(3), ["7", "8", "9"]);
         assert_eq!(p.tail(0).len(), 0);
         assert_eq!(p.tail(99).len(), 10);
+    }
+
+    #[test]
+    fn an_inferred_state_shows_no_age() {
+        let mut it = item("claude", Kind::Unreported, 0);
+        it.inferred = true;
+        assert_eq!(it.age_label(), "~");
+        it.inferred = false;
+        assert_eq!(it.age_label(), "-");
     }
 }

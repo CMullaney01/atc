@@ -97,10 +97,15 @@ pub(crate) fn classify(info: &PaneInfo, state: Option<&PaneState>) -> Kind {
     if state.is_some() {
         return Kind::Session;
     }
-    if titled_like_claude(&info.title) || looks_like_a_version(&info.command) {
+    let cmd = base_command(&info.command);
+    // A title outlives the program that set it, so a pane Claude Code has
+    // exited still says "✳" while plainly being a shell again. A running
+    // session never reports a shell as its command, so the command decides.
+    let back_to_a_shell = SHELLS.contains(&cmd);
+    if looks_like_a_version(&info.command) || (titled_like_claude(&info.title) && !back_to_a_shell)
+    {
         return Kind::Unreported;
     }
-    let cmd = base_command(&info.command);
     if TOOLS.contains(&cmd) {
         Kind::Tool
     } else if SHELLS.contains(&cmd) {
@@ -143,11 +148,9 @@ mod tests {
             classify(&pane("✳ fix-pyright-lint-errors", "2.1.308"), None),
             Kind::Unreported
         );
-        // Title alone is enough, even when the command looks like a shell.
-        assert_eq!(
-            classify(&pane("✳ Claude Code", "zsh"), None),
-            Kind::Unreported
-        );
+        // A pane Claude Code has exited keeps the title it set, so the title
+        // alone is not enough: this one is a shell again.
+        assert_eq!(classify(&pane("✳ Claude Code", "zsh"), None), Kind::Shell);
         // Version alone is enough, even with no title.
         assert_eq!(classify(&pane("", "2.1.296"), None), Kind::Unreported);
     }

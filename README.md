@@ -25,30 +25,55 @@ resizes, and `q` dismisses it:
 
 ```
 ┌─ atc — 4 session(s), 2 need you ─────────────────────────────┐
-│ ▌● fix-pyright-lint   waiting    4m  myworkspace:0.1  dotfiles/main
-│  ! coding-standards   blocked   45s  myworkspace:0.2  atc/main
-│  ◐ atc-command-center working    8s  myworkspace:1.0  atc/v1 │
-│  ? add-k9s-dotfiles   unreported  -  myworkspace:1.2  dotfiles
-│                                                              │
-│  other panes                                                 │
-│  · nvim               tool           myworkspace:0.0  nvim   │
-│  ◐ cargo              job            myworkspace:2.1  atc/v1 │
-├─ myworkspace:0.1 · dotfiles/main ────────────────────────────┤
-│ > cargo test                                                 │
+│ myworkspace                                                  │
+│   0 editor                                                   │
+│     ·  nvim                tool                  nvim        │
+│     ◐  cargo               job                   atc/main    │
+│   1 atc                                                      │
+│ ▌ ●  fix-pyright-lint      waiting    4m  dotfiles/main      │
+│     ◐  atc-command-center  working    8s  atc/main           │
+│        ⑂ Explore                 1m                          │
+│        ⑂ general-purpose        12s                          │
+│   2 review                                                   │
+│     !  coding-standards    blocked   45s  atc/main           │
+│     ●~ add-k9s-dotfiles    waiting    ~   dotfiles/main      │
+├─ myworkspace:1.0 · dotfiles/main ────────────────────────────┤
 │ test result: ok. 42 passed; 0 failed                         │
-│                                                              │
 │ Fixed the 3 type errors. Want me to run the tests?           │
-│ ▌                                                            │
 ├──────────────────────────────────────────────────────────────┤
 │ enter jump  p prompt  x kill  tab other panes  q close       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Most urgent first, so whatever needs you is always the top row. The bottom half
-is the live screen of whichever pane is selected, so you can read what a session
-actually said — and answer it with `p` — without going there at all. Everything
-is jumpable too, so the popup is also how you get back to the `nvim` or `k9s`
-pane.
+Grouped the way your tmux is: session, then window, then the panes in it. So a
+session always appears next to whatever it shares a window with, and you can see
+at a glance which terminal belongs to what. Windows lead with whatever is most
+urgent, and the session you are attached to comes first, so the thing that wants
+you still rises to the top.
+
+The bottom half is the live screen of whichever pane is selected, so you can read
+what a session actually said — and answer it with `p` — without going there.
+Everything is jumpable, so the popup is also how you get back to the `nvim` or
+`k9s` pane.
+
+`⑂` rows are the subagents running under a session, with how long each has been
+going. They are not panes, so `j`/`k` step over them and `enter`, `p` and `x`
+never land on one.
+
+`~` means the state was read off the pane's own screen rather than reported by a
+hook — see [Sessions that never reported](#sessions-that-never-reported).
+
+## Sessions that never reported
+
+A session that started before atc was watching has fired no hook, so there is
+nothing on disk for it. Rather than show it as unknown, atc reads its screen:
+the interrupt hint means it is working, a permission question with numbered
+options means it is blocked, and a bare input box means it is waiting for you.
+Anything it does not recognise stays unknown.
+
+These are guesses about Claude Code's current interface, not a contract, so they
+are marked `~` everywhere they appear and a real hook always wins. Nothing
+inferred is ever written to disk.
 
 ## States
 

@@ -18,11 +18,15 @@ pub(crate) struct HookInput {
     /// Present only when the hook fired inside a subagent.
     #[serde(default)]
     pub(crate) agent_id: Option<String>,
+    /// The subagent's display name, such as `Explore`. Can be empty for the
+    /// agents Claude Code runs internally.
+    #[serde(default)]
+    pub(crate) agent_type: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Outcome {
-    Update(PaneState),
+    Update(Box<PaneState>),
     Remove,
     Ignore,
 }
@@ -51,6 +55,31 @@ pub(crate) fn apply(
     pane_id: &str,
     prev: Option<PaneState>,
 ) -> Outcome {
+    // These two are about a subagent rather than from inside one, so they are
+    // read before the guard below, which would otherwise swallow them.
+    if matches!(event, "SubagentStart" | "SubagentStop") {
+        let Some(prev) = prev else {
+            return Outcome::Ignore; // nothing known about this pane yet
+        };
+        let Some(agent_id) = input.agent_id.clone() else {
+            return Outcome::Ignore;
+        };
+        let mut st = prev;
+        match event {
+            "SubagentStart" => {
+                if !st.subagents.iter().any(|a| a.id == agent_id) {
+                    st.subagents.push(state::Subagent {
+                        id: agent_id,
+                        agent_type: input.agent_type.clone(),
+                        since: state::now(),
+                    });
+                }
+            }
+            _ => st.subagents.retain(|a| a.id != agent_id),
+        }
+        return Outcome::Update(Box::new(st));
+    }
+
     // A subagent finishing says nothing about whether the session as a whole
     // wants input, so its Stop must never mark the pane as waiting.
     let in_subagent = input.agent_id.is_some();
@@ -78,9 +107,13 @@ pub(crate) fn apply(
 
     let mut mark_stale = false;
     let next = match event {
-        "SessionStart" => Some(Status::Idle),
+        "SessionStart" => {
+            st.subagents.clear();
+            Some(Status::Idle)
+        }
         "UserPromptSubmit" => {
             st.last_message = None;
+            st.subagents.clear();
             Some(Status::Working)
         }
         "PreToolUse" | "PostToolUse" => {
@@ -93,6 +126,7 @@ pub(crate) fn apply(
         }
         "Stop" => {
             st.tool = None;
+            st.subagents.clear();
             if let Some(msg) = &input.last_assistant_message {
                 st.last_message = Some(first_line(msg));
             }
@@ -127,7 +161,7 @@ pub(crate) fn apply(
         st.stale = true;
     }
 
-    Outcome::Update(st)
+    Outcome::Update(Box::new(st))
 }
 
 #[cfg(test)]
@@ -140,9 +174,93 @@ mod tests {
 
     fn updated(o: Outcome) -> PaneState {
         match o {
-            Outcome::Update(st) => st,
+            Outcome::Update(st) => *st,
             other => panic!("expected an update, got {:?}", other),
         }
+    }
+
+    fn with_agent(id: &str, kind: &str) -> HookInput {
+        let mut i = input();
+        i.agent_id = Some(id.into());
+        i.agent_type = Some(kind.into());
+        i
+    }
+
+    #[test]
+    fn subagents_are_tracked_while_they_run() {
+        let pane = PaneState::new("%6");
+        let one = updated(apply(
+            "SubagentStart",
+            None,
+            &with_agent("a1", "Explore"),
+            "%6",
+            Some(pane),
+        ));
+        assert_eq!(one.subagents.len(), 1);
+        assert_eq!(one.subagents[0].label(), "Explore");
+
+        let two = updated(apply(
+            "SubagentStart",
+            None,
+            &with_agent("a2", ""),
+            "%6",
+            Some(one.clone()),
+        ));
+        assert_eq!(two.subagents.len(), 2);
+        assert_eq!(
+            two.subagents[1].label(),
+            "agent",
+            "an empty type still reads"
+        );
+
+        let again = updated(apply(
+            "SubagentStart",
+            None,
+            &with_agent("a1", "Explore"),
+            "%6",
+            Some(two.clone()),
+        ));
+        assert_eq!(
+            again.subagents.len(),
+            2,
+            "the same agent must not count twice"
+        );
+
+        let gone = updated(apply(
+            "SubagentStop",
+            None,
+            &with_agent("a1", "Explore"),
+            "%6",
+            Some(again),
+        ));
+        assert_eq!(gone.subagents.len(), 1);
+        assert_eq!(gone.subagents[0].id, "a2");
+    }
+
+    #[test]
+    fn a_turn_boundary_clears_the_subagent_set() {
+        let mut pane = PaneState::new("%6");
+        pane.subagents = vec![state::Subagent {
+            id: "stale".into(),
+            agent_type: None,
+            since: 0,
+        }];
+        for event in ["Stop", "UserPromptSubmit", "SessionStart"] {
+            let st = updated(apply(event, None, &input(), "%6", Some(pane.clone())));
+            assert!(
+                st.subagents.is_empty(),
+                "{event} should leave nothing running"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subagent_event_for_an_unknown_pane_is_ignored() {
+        let i = with_agent("a1", "Explore");
+        assert_eq!(
+            apply("SubagentStart", None, &i, "%6", None),
+            Outcome::Ignore
+        );
     }
 
     #[test]
