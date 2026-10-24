@@ -11,14 +11,35 @@ panes to look. `atc` puts that on your status bar and behind one keystroke.
 ┌──────────────────────────────────────────────────────────────┐
 │  (your panes — nothing moves, nothing resizes)               │
 ├──────────────────────────────────────────────────────────────┤
-│ [myworkspace] 0:editor! 1:atc◐ 2:binance                     │  ← window names flagged
-│ 0:editor ●!  1:atc ◐  │  [review] 0:zsh ✓                    │  ← the fleet row
+│ 0:editor ·◐●   1:atc ◐●◐ -   2:dotfiles ! *                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-One cluster per window, one glyph per pane. A flagged window name tells you
-where to go; the fleet row tells you which pane inside it, including panes in
-tmux sessions you aren't attached to.
+One row — tmux's own window list, with one glyph per AI pane added inside each
+window name. tmux keeps its flags and its current-window highlight; atc only
+fills in the glyphs, through a window option, so nothing is rendered per redraw.
+
+Colour is on by default. For shape and weight only:
+
+```sh
+set -g @atc_colour off
+```
+
+Bound to a key if you want to flip it while looking at the bar:
+
+```sh
+bind-key A if-shell -F '#{==:#{@atc_colour},off}' \
+  'set -g @atc_colour on' 'set -g @atc_colour off'
+```
+
+Sessions in *other* tmux sessions are not on the bar — the command center
+groups by session and is the place to see all of them at once. If you would
+rather have the old second row, which does show them, add:
+
+```sh
+set -g status 2
+set -g status-format[1] "#[align=left] #(atc bar #{session_name})"
+```
 
 `prefix + a` opens the command center over the top of your layout — nothing
 resizes, and `q` dismisses it:
@@ -168,6 +189,7 @@ the server was started. `atc doctor` will tell you if it isn't.
 | `atc bar [session] [--all]` | Render the fleet row; `--all` includes non-AI panes |
 | `atc status [--json]` | Report every tracked session |
 | `atc ui` | Open the command center |
+| `atc sync` | Refresh every window's glyphs (tmux runs this each redraw) |
 | `atc state <status> [--title <t>]` | Report state for the current pane by hand |
 | `atc seen <pane-id>` | Drop a pane's escalation flag |
 | `atc ask <question>` | Ask Claude about the fleet |

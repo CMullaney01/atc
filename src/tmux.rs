@@ -106,6 +106,14 @@ pub(crate) fn unset_pane_option(pane: &str, key: &str) {
     fire(&["set-option", "-pu", "-t", pane, key]);
 }
 
+/// A global option's value, or `None` when it has never been set. `-q` keeps
+/// tmux quiet about options it does not know.
+pub(crate) fn global_option(key: &str) -> Option<String> {
+    let v = run(&["show-options", "-gqv", key])?;
+    let v = v.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
 pub(crate) fn set_window_option(target: &str, key: &str, value: &str) {
     fire(&["set-option", "-w", "-t", target, key, value]);
 }
