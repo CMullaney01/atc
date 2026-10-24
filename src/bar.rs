@@ -156,6 +156,37 @@ type SessionGroup = (String, Vec<WindowGroup>);
 /// panes keep their on-screen order inside a window, so a session always
 /// appears next to whatever it shares a window with.
 pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>) -> Vec<TreeRow> {
+    let mut sessions = group_by_window(entries);
+    order_sessions(&mut sessions, entries, current_session);
+
+    let mut out = Vec::new();
+    for (session, mut windows) in sessions {
+        out.push(TreeRow::Session(session));
+        windows.sort_by(|a, b| {
+            worst_of(entries, &b.2)
+                .cmp(&worst_of(entries, &a.2))
+                .then(a.0.cmp(&b.0))
+        });
+        for (index, name, members) in windows {
+            out.push(TreeRow::Window { index, name });
+            out.extend(members.into_iter().map(TreeRow::Pane));
+        }
+    }
+    out
+}
+
+/// How much the most urgent pane in a group wants you.
+fn worst_of(entries: &[Entry], members: &[usize]) -> u8 {
+    members
+        .iter()
+        .map(|i| entries[*i].urgency())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Panes collected under their window, and windows under their session, with
+/// each window's panes in the order they sit on screen.
+fn group_by_window(entries: &[Entry]) -> Vec<SessionGroup> {
     let mut windows: BTreeMap<(String, u32), (String, Vec<usize>)> = BTreeMap::new();
     for (i, e) in entries.iter().enumerate() {
         windows
@@ -165,14 +196,6 @@ pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>) -> Vec<Tree
             .push(i);
     }
 
-    let worst = |members: &[usize]| {
-        members
-            .iter()
-            .map(|i| entries[*i].urgency())
-            .max()
-            .unwrap_or(0)
-    };
-
     let mut by_session: BTreeMap<String, Vec<WindowGroup>> = BTreeMap::new();
     for ((session, index), (name, mut members)) in windows {
         members.sort_by_key(|i| entries[*i].info.pane_index);
@@ -181,32 +204,31 @@ pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>) -> Vec<Tree
             .or_default()
             .push((index, name, members));
     }
+    by_session.into_iter().collect()
+}
 
-    let mut sessions: Vec<SessionGroup> = by_session.into_iter().collect();
+/// The session you are attached to leads, then whichever holds the most urgent
+/// pane, then by name so the order never wobbles between redraws.
+fn order_sessions(sessions: &mut [SessionGroup], entries: &[Entry], current: Option<&str>) {
     sessions.sort_by(|a, b| {
-        let mine = |name: &str| u8::from(current_session.is_some_and(|c| c == name));
+        let mine = |name: &str| u8::from(current.is_some_and(|c| c == name));
+        let worst_in = |windows: &Vec<WindowGroup>| {
+            windows
+                .iter()
+                .map(|w| worst_of(entries, &w.2))
+                .max()
+                .unwrap_or(0)
+        };
         mine(&b.0)
             .cmp(&mine(&a.0))
-            .then(
-                b.1.iter()
-                    .map(|w| worst(&w.2))
-                    .max()
-                    .cmp(&a.1.iter().map(|w| worst(&w.2)).max()),
-            )
+            .then(worst_in(&b.1).cmp(&worst_in(&a.1)))
             .then(a.0.cmp(&b.0))
     });
-
-    let mut out = Vec::new();
-    for (session, mut wins) in sessions {
-        out.push(TreeRow::Session(session));
-        wins.sort_by(|a, b| worst(&b.2).cmp(&worst(&a.2)).then(a.0.cmp(&b.0)));
-        for (index, name, members) in wins {
-            out.push(TreeRow::Window { index, name });
-            out.extend(members.into_iter().map(TreeRow::Pane));
-        }
-    }
-    out
 }
+
+/// Marks a state worked out from a pane's screen rather than reported by a
+/// hook, wherever one is shown.
+pub(crate) const INFERRED_MARK: &str = "~";
 
 /// Whether the bar paints its own glyphs or leaves them in the status bar's
 /// colours. Off is a useful fallback for a bar whose styling the palette fights.
@@ -363,6 +385,28 @@ mod tests {
         }
     }
 
+    /// The row with every style directive stripped, so a test about what is
+    /// drawn does not break when the palette changes. A palette change broke
+    /// one of these once.
+    fn visible(row: &str) -> String {
+        let mut out = String::new();
+        let mut rest = row;
+        while let Some(open) = rest.find("#[") {
+            out.push_str(&rest[..open]);
+            match rest[open..].find(']') {
+                Some(close) => rest = &rest[open + close + 1..],
+                None => break,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Whether a window's cluster holds a glyph for a quiet, non-session pane.
+    fn counts_quiet_panes(row: &str) -> usize {
+        row.matches(Kind::Tool.colour()).count()
+    }
+
     fn ai_only() -> RowOpts {
         RowOpts {
             scope: Scope::AiOnly,
@@ -460,8 +504,9 @@ mod tests {
         ];
         let inv = inventory(&states, &panes);
         let row = render(&inv, Some("ws"), ai_only());
-        assert!(row.contains("0:nvim"), "row was: {row}");
-        assert!(row.contains("1:claude"));
+        let seen = visible(&row);
+        assert!(seen.contains("0:nvim"), "row was: {seen}");
+        assert!(seen.contains("1:claude"), "row was: {seen}");
         let zero = row.split("1:claude").next().unwrap();
         assert!(zero.contains(Status::Waiting.glyph()));
         assert!(zero.contains(Status::Working.glyph()));
@@ -487,18 +532,17 @@ mod tests {
         let states = vec![st("%3", Status::Waiting)];
         let inv = inventory(&states, &panes);
 
-        let quiet = Kind::Tool.colour();
         let row = render(&inv, Some("ws"), ai_only());
         assert!(row.contains(Status::Waiting.glyph()));
         assert_eq!(
-            row.matches(quiet).count(),
+            counts_quiet_panes(&row),
             0,
             "tool/shell glyphs must not be on the default row: {row}"
         );
 
         let full = render(&inv, Some("ws"), everything());
         assert!(
-            full.matches(quiet).count() >= 2,
+            counts_quiet_panes(&full) >= 2,
             "nvim and zsh should both show with --all: {full}"
         );
     }
@@ -511,7 +555,7 @@ mod tests {
         let inv = inventory(&[], &panes);
         assert_eq!(inv[0].kind, Kind::Unreported);
         let row = render(&inv, Some("ws"), ai_only());
-        assert!(row.contains('?'), "row was: {row}");
+        assert!(visible(&row).contains('?'), "row was: {row}");
     }
 
     #[test]
@@ -540,6 +584,7 @@ mod tests {
         s.stale = true;
         let inv = inventory(std::slice::from_ref(&s), &panes);
         let row = render(&inv, Some("ws"), ai_only());
+        // Weight is the escalation signal, so asserting on it is the point.
         assert!(row.contains("bold"), "row was: {row}");
     }
 

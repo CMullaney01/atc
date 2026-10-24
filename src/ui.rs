@@ -7,7 +7,7 @@ use crate::bar::TreeRow;
 use crate::pane::Kind;
 use crate::state::{self, Status, Subagent};
 use crate::{bar, infer, tmux};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -73,7 +73,7 @@ impl Item {
     fn age_label(&self) -> String {
         match self.age {
             Some(secs) => state::fmt_age(secs),
-            None if self.inferred => "~".to_string(),
+            None if self.inferred => bar::INFERRED_MARK.to_string(),
             None => "-".to_string(),
         }
     }
@@ -280,126 +280,205 @@ pub(crate) fn run() {
     }
 }
 
+/// Everything the popup keeps between frames. It exists so each key can be
+/// read on its own rather than as one long loop.
+struct Popup {
+    items: Vec<Item>,
+    order: Vec<TreeRow>,
+    ai_count: usize,
+    cursor: usize,
+    offset: usize,
+    show_others: bool,
+    mode: Mode,
+    preview: Preview,
+    cache: HashMap<String, Option<String>>,
+    last_refresh: Instant,
+    /// Where to send the tmux client once the popup is off the screen.
+    jump: Option<(String, String, u32)>,
+}
+
+impl Popup {
+    fn new() -> Self {
+        let mut cache = HashMap::new();
+        let (items, order, ai_count) = snapshot(&mut cache);
+        Popup {
+            items,
+            order,
+            ai_count,
+            cursor: 0,
+            offset: 0,
+            show_others: true,
+            mode: Mode::Browse,
+            preview: Preview::blank(),
+            cache,
+            last_refresh: Instant::now(),
+            jump: None,
+        }
+    }
+
+    fn reload(&mut self) {
+        let (items, order, ai_count) = snapshot(&mut self.cache);
+        self.items = items;
+        self.order = order;
+        self.ai_count = ai_count;
+        self.last_refresh = Instant::now();
+    }
+
+    fn refresh_if_stale(&mut self) {
+        if self.last_refresh.elapsed() > Duration::from_secs(1) {
+            self.reload();
+        }
+    }
+
+    /// The drawn lines and, of those, the item indices the cursor can land on.
+    fn visible(&self) -> (Vec<Row>, Vec<usize>) {
+        let rows = build_rows(&self.items, &self.order, self.show_others);
+        let pick = selectable(&rows);
+        (rows, pick)
+    }
+
+    fn render(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+        let (rows, pick) = self.visible();
+        self.cursor = self.cursor.min(pick.len().saturating_sub(1));
+        let chosen = pick.get(self.cursor).copied();
+
+        let following = chosen.map(|i| self.items[i].pane_id.clone());
+        self.preview.follow(following.as_deref());
+
+        let mut offset = self.offset;
+        let view = View {
+            items: &self.items,
+            rows: &rows,
+            chosen,
+            ai_count: self.ai_count,
+            hidden: self.items.len() - pick.len(),
+            mode: &self.mode,
+            preview: &self.preview,
+        };
+        terminal.draw(|f| {
+            offset = draw(f, &view, offset);
+        })?;
+        self.offset = offset;
+        Ok(())
+    }
+
+    /// False when the popup should close.
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        let (_, pick) = self.visible();
+        let chosen = pick.get(self.cursor).copied();
+        if matches!(self.mode, Mode::Prompt(_)) {
+            self.prompt_key(key, chosen);
+            return true;
+        }
+        if matches!(self.mode, Mode::ConfirmKill) {
+            self.confirm_key(key, chosen);
+            return true;
+        }
+        self.browse_key(key, chosen, pick.len())
+    }
+
+    /// Typing a reply to send to the selected session. The buffer is taken out
+    /// of the mode and only put back if the prompt is still open afterwards.
+    fn prompt_key(&mut self, key: KeyEvent, chosen: Option<usize>) {
+        let Mode::Prompt(mut buf) = std::mem::replace(&mut self.mode, Mode::Browse) else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => {
+                if let Some(i) = chosen {
+                    if !buf.is_empty() {
+                        tmux::send_keys(&self.items[i].pane_id, &buf);
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                self.mode = Mode::Prompt(buf);
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                self.mode = Mode::Prompt(buf);
+            }
+            _ => self.mode = Mode::Prompt(buf),
+        }
+    }
+
+    fn confirm_key(&mut self, key: KeyEvent, chosen: Option<usize>) {
+        if key.code == KeyCode::Char('y') {
+            if let Some(i) = chosen {
+                let pane = self.items[i].pane_id.clone();
+                tmux::kill_pane(&pane);
+                let _ = state::remove(&pane);
+            }
+            self.reload();
+        }
+        self.mode = Mode::Browse;
+    }
+
+    fn browse_key(&mut self, key: KeyEvent, chosen: Option<usize>, count: usize) -> bool {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if count > 0 {
+                    self.cursor = (self.cursor + 1).min(count - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Char('g') => self.cursor = 0,
+            KeyCode::Char('G') => self.cursor = count.saturating_sub(1),
+            KeyCode::Tab => self.show_others = !self.show_others,
+            KeyCode::Char('r') => {
+                self.cache.clear();
+                self.reload();
+            }
+            KeyCode::Char('p') => {
+                // Only an AI session can take a prompt.
+                if chosen.is_some_and(|i| self.items[i].kind.is_ai()) {
+                    self.mode = Mode::Prompt(String::new());
+                }
+            }
+            KeyCode::Char('x') => {
+                if chosen.is_some() {
+                    self.mode = Mode::ConfirmKill;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(i) = chosen {
+                    let item = &self.items[i];
+                    let target = (
+                        item.pane_id.clone(),
+                        item.session.clone(),
+                        item.window_index,
+                    );
+                    self.jump = Some(target);
+                }
+                return false;
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
 fn event_loop() -> io::Result<()> {
     let mut out = io::stdout();
     enable_raw_mode()?;
     crossterm::execute!(out, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let mut cache: HashMap<String, Option<String>> = HashMap::new();
-    let (mut items, mut order, mut ai_count) = snapshot(&mut cache);
-    let mut cursor: usize = 0;
-    let mut offset: usize = 0;
-    let mut show_others = true;
-    let mut mode = Mode::Browse;
-    let mut preview = Preview::blank();
-    let mut last_refresh = Instant::now();
-    let mut jump: Option<(String, String, u32)> = None;
-
+    let mut popup = Popup::new();
     loop {
-        let rows = build_rows(&items, &order, show_others);
-        let pick = selectable(&rows);
-        cursor = cursor.min(pick.len().saturating_sub(1));
-        let chosen = pick.get(cursor).copied();
-        preview.follow(chosen.map(|i| items[i].pane_id.as_str()));
-
-        terminal.draw(|f| {
-            let view = View {
-                items: &items,
-                rows: &rows,
-                chosen,
-                ai_count,
-                hidden: items.len() - pick.len(),
-                mode: &mode,
-                preview: &preview,
-            };
-            offset = draw(f, &view, offset);
-        })?;
-
+        popup.render(&mut terminal)?;
         if event::poll(Duration::from_millis(300))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match &mut mode {
-                    Mode::Prompt(buf) => match key.code {
-                        KeyCode::Esc => mode = Mode::Browse,
-                        KeyCode::Enter => {
-                            if let Some(item) = chosen.map(|i| &items[i]) {
-                                if !buf.is_empty() {
-                                    tmux::send_keys(&item.pane_id, buf);
-                                }
-                            }
-                            mode = Mode::Browse;
-                        }
-                        KeyCode::Backspace => {
-                            buf.pop();
-                        }
-                        KeyCode::Char(c) => buf.push(c),
-                        _ => {}
-                    },
-                    Mode::ConfirmKill => match key.code {
-                        KeyCode::Char('y') => {
-                            if let Some(item) = chosen.map(|i| &items[i]) {
-                                tmux::kill_pane(&item.pane_id);
-                                let _ = state::remove(&item.pane_id);
-                            }
-                            (items, order, ai_count) = snapshot(&mut cache);
-                            mode = Mode::Browse;
-                        }
-                        _ => mode = Mode::Browse,
-                    },
-                    Mode::Browse => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            break
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !pick.is_empty() {
-                                cursor = (cursor + 1).min(pick.len() - 1);
-                            }
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            cursor = cursor.saturating_sub(1);
-                        }
-                        KeyCode::Char('g') => cursor = 0,
-                        KeyCode::Char('G') => cursor = pick.len().saturating_sub(1),
-                        KeyCode::Tab => show_others = !show_others,
-                        KeyCode::Char('r') => {
-                            cache.clear();
-                            (items, order, ai_count) = snapshot(&mut cache);
-                        }
-                        KeyCode::Char('p') => {
-                            // Only an AI session can take a prompt.
-                            if chosen.is_some_and(|i| items[i].kind.is_ai()) {
-                                mode = Mode::Prompt(String::new());
-                            }
-                        }
-                        KeyCode::Char('x') => {
-                            if chosen.is_some() {
-                                mode = Mode::ConfirmKill;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            if let Some(item) = chosen.map(|i| &items[i]) {
-                                jump = Some((
-                                    item.pane_id.clone(),
-                                    item.session.clone(),
-                                    item.window_index,
-                                ));
-                            }
-                            break;
-                        }
-                        _ => {}
-                    },
+                if key.kind == KeyEventKind::Press && !popup.on_key(key) {
+                    break;
                 }
             }
         }
-
-        if last_refresh.elapsed() > Duration::from_secs(1) {
-            (items, order, ai_count) = snapshot(&mut cache);
-            last_refresh = Instant::now();
-        }
+        popup.refresh_if_stale();
     }
 
     disable_raw_mode()?;
@@ -407,7 +486,7 @@ fn event_loop() -> io::Result<()> {
     terminal.show_cursor()?;
 
     // Jump after restoring the terminal so the popup is gone before the client moves.
-    if let Some((pane, session, window)) = jump {
+    if let Some((pane, session, window)) = popup.jump {
         tmux::focus(&pane, &session, window);
     }
     Ok(())
@@ -437,7 +516,11 @@ fn item_line(item: &Item, chosen: bool) -> Line<'static> {
         ),
         Span::styled(item.glyph(), glyph_style),
         Span::styled(
-            if item.inferred { "~ " } else { "  " },
+            if item.inferred {
+                format!("{} ", bar::INFERRED_MARK)
+            } else {
+                "  ".to_string()
+            },
             base.fg(Color::Indexed(244)),
         ),
         Span::styled(format!("{:<24} ", crop(&item.title, 24)), base),
@@ -487,20 +570,8 @@ struct View<'a> {
 
 /// Returns the scroll offset it settled on, so the next frame starts where this
 /// one left off.
-fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(3)])
-        .split(f.area());
-    let split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(outer[0]);
-
-    let empty_notice = usize::from(v.ai_count == 0);
-    let list_height = usize::from(split[0].height.saturating_sub(2)).saturating_sub(empty_notice);
-    let offset = scroll_offset(v.rows.len(), list_height, row_of(v.rows, v.chosen), offset);
-
+/// The visible slice of the tree, as drawn lines.
+fn list_lines<'a>(v: &'a View, offset: usize, list_height: usize) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
     if v.ai_count == 0 {
         lines.push(Line::from(Span::styled(
@@ -524,6 +595,24 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
             Row::Subagent { parent, agent } => subagent_line(&v.items[*parent].subagents[*agent]),
         });
     }
+    lines
+}
+
+fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(f.area());
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(outer[0]);
+
+    let empty_notice = usize::from(v.ai_count == 0);
+    let list_height = usize::from(split[0].height.saturating_sub(2)).saturating_sub(empty_notice);
+    let offset = scroll_offset(v.rows.len(), list_height, row_of(v.rows, v.chosen), offset);
+
+    let lines = list_lines(v, offset, list_height);
 
     let needs_you = v
         .items
@@ -749,7 +838,7 @@ mod tests {
     fn an_inferred_state_shows_no_age() {
         let mut it = item("claude", Kind::Unreported, 0);
         it.inferred = true;
-        assert_eq!(it.age_label(), "~");
+        assert_eq!(it.age_label(), bar::INFERRED_MARK);
         it.inferred = false;
         assert_eq!(it.age_label(), "-");
     }

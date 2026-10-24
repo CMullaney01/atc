@@ -47,6 +47,44 @@ fn first_line(msg: &str) -> String {
     }
 }
 
+/// Adds or removes one live subagent. Nothing else about the pane changes: a
+/// session with an agent running underneath it is already working.
+fn track_subagent(event: &str, input: &HookInput, prev: Option<PaneState>) -> Outcome {
+    let Some(mut st) = prev else {
+        return Outcome::Ignore; // nothing known about this pane yet
+    };
+    let Some(agent_id) = input.agent_id.clone() else {
+        return Outcome::Ignore;
+    };
+    if event == "SubagentStart" {
+        if !st.subagents.iter().any(|a| a.id == agent_id) {
+            st.subagents.push(state::Subagent {
+                id: agent_id,
+                agent_type: input.agent_type.clone(),
+                since: state::now(),
+            });
+        }
+    } else {
+        st.subagents.retain(|a| a.id != agent_id);
+    }
+    Outcome::Update(Box::new(st))
+}
+
+/// Takes whatever the payload happens to carry. Every field is optional and an
+/// event that omits one must not wipe what an earlier event already said.
+fn carry_over(st: &mut PaneState, input: &HookInput, pane_id: &str) {
+    st.pane_id = pane_id.to_string();
+    if input.session_id.is_some() {
+        st.session_id = input.session_id.clone();
+    }
+    if input.cwd.is_some() {
+        st.cwd = input.cwd.clone();
+    }
+    if input.session_title.is_some() {
+        st.title = input.session_title.clone();
+    }
+}
+
 /// Maps a Claude Code hook event onto a pane's state.
 ///
 /// `kind` is the Notification matcher, passed as an argument rather than read
@@ -61,26 +99,7 @@ pub(crate) fn apply(
     // These two are about a subagent rather than from inside one, so they are
     // read before the guard below, which would otherwise swallow them.
     if matches!(event, "SubagentStart" | "SubagentStop") {
-        let Some(prev) = prev else {
-            return Outcome::Ignore; // nothing known about this pane yet
-        };
-        let Some(agent_id) = input.agent_id.clone() else {
-            return Outcome::Ignore;
-        };
-        let mut st = prev;
-        match event {
-            "SubagentStart" => {
-                if !st.subagents.iter().any(|a| a.id == agent_id) {
-                    st.subagents.push(state::Subagent {
-                        id: agent_id,
-                        agent_type: input.agent_type.clone(),
-                        since: state::now(),
-                    });
-                }
-            }
-            _ => st.subagents.retain(|a| a.id != agent_id),
-        }
-        return Outcome::Update(Box::new(st));
+        return track_subagent(event, input, prev);
     }
 
     // A subagent finishing says nothing about whether the session as a whole
@@ -96,36 +115,74 @@ pub(crate) fn apply(
 
     let existed = prev.is_some();
     let mut st = prev.unwrap_or_else(|| PaneState::new(pane_id));
-    st.pane_id = pane_id.to_string();
+    carry_over(&mut st, input, pane_id);
 
-    if input.session_id.is_some() {
-        st.session_id = input.session_id.clone();
+    let Some(step) = transition(event, kind, input, &mut st) else {
+        return Outcome::Ignore;
+    };
+
+    if let Some(s) = step.status {
+        if st.status != s || !existed {
+            st.status = s;
+            st.since = state::now();
+            st.stale = false;
+        }
     }
-    if input.cwd.is_some() {
-        st.cwd = input.cwd.clone();
-    }
-    if input.session_title.is_some() {
-        st.title = input.session_title.clone();
+    if step.stale {
+        st.stale = true;
     }
 
-    let mut mark_stale = false;
-    let next = match event {
+    Outcome::Update(Box::new(st))
+}
+
+/// What one event means. `status` is the state to move to, if any; `stale`
+/// marks the pane as something you have already been told about and ignored.
+struct Step {
+    status: Option<Status>,
+    stale: bool,
+}
+
+impl Step {
+    fn to(status: Status) -> Option<Step> {
+        Some(Step {
+            status: Some(status),
+            stale: false,
+        })
+    }
+
+    fn escalate(status: Option<Status>) -> Option<Step> {
+        Some(Step {
+            status,
+            stale: true,
+        })
+    }
+}
+
+/// The event table. Writes the payload's detail onto the pane as it goes, and
+/// answers `None` for an event that means nothing here.
+fn transition(
+    event: &str,
+    kind: Option<&str>,
+    input: &HookInput,
+    st: &mut PaneState,
+) -> Option<Step> {
+    match event {
         "SessionStart" => {
             st.subagents.clear();
-            Some(Status::Idle)
+            Step::to(Status::Idle)
         }
         "UserPromptSubmit" => {
             st.last_message = None;
             st.subagents.clear();
-            Some(Status::Working)
+            Step::to(Status::Working)
         }
         "PreToolUse" | "PostToolUse" => {
             st.tool = input.tool_name.clone();
-            Some(Status::Working)
+            Step::to(Status::Working)
         }
         "PermissionRequest" => {
             st.tool = input.tool_name.clone();
-            Some(Status::Blocked)
+            Step::to(Status::Blocked)
         }
         "Stop" => {
             st.tool = None;
@@ -133,40 +190,21 @@ pub(crate) fn apply(
             if let Some(msg) = &input.last_assistant_message {
                 st.last_message = Some(first_line(msg));
             }
-            Some(Status::Waiting)
+            Step::to(Status::Waiting)
         }
-        "StopFailure" | "PostToolUseFailure" => Some(Status::Error),
+        "StopFailure" | "PostToolUseFailure" => Step::to(Status::Error),
         // Notification is an escalation signal only: permission_prompt lags the
         // real prompt by ~6s and idle_prompt by ~60s, so Stop and
         // PermissionRequest drive state and these just flag it as ignored.
         // Gemini has no matchers, so it names the alert in the payload instead.
         // Reading both means one arm serves every agent.
         "Notification" => match kind.or(input.notification_type.as_deref()) {
-            Some("permission_prompt" | "ToolPermission") => {
-                mark_stale = true;
-                Some(Status::Blocked)
-            }
-            Some("idle_prompt") => {
-                mark_stale = true;
-                None
-            }
-            _ => return Outcome::Ignore,
+            Some("permission_prompt" | "ToolPermission") => Step::escalate(Some(Status::Blocked)),
+            Some("idle_prompt") => Step::escalate(None),
+            _ => None,
         },
-        _ => return Outcome::Ignore,
-    };
-
-    if let Some(s) = next {
-        if st.status != s || !existed {
-            st.status = s;
-            st.since = state::now();
-            st.stale = false;
-        }
+        _ => None,
     }
-    if mark_stale {
-        st.stale = true;
-    }
-
-    Outcome::Update(Box::new(st))
 }
 
 #[cfg(test)]
