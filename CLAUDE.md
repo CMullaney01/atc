@@ -15,8 +15,8 @@ before adding a crate, `rex-code-smells` for an audit.
 
 ## Getting the skills onto a machine
 
-They are not in the repo — `.claude/` is globally gitignored, so a fresh clone
-has no `.claude/skills/`. Install them from the
+They are not in the repo — `.claude/` is gitignored, so a fresh clone has no
+`.claude/skills/`. Install them from the
 [`rex-skills`](https://crates.io/crates/rex-skills) crate (MIT), which is also
 how to refresh them:
 
@@ -24,9 +24,12 @@ how to refresh them:
 cargo install rex-skills && rex skills
 ```
 
-That also wants to write `.pre-commit-config.yaml` and install git hooks needing
-`pre-commit`, `gitleaks` and `trivy` on PATH. Not set up here — `cargo fmt`,
-`cargo clippy -D warnings` and `cargo test` are run by hand instead.
+That gives you the `rex` helpers too: `rex codebase --rust-only --with-context`
+for the module map, and `rex smells` to list every `SMELL:` flag left in the
+code.
 
-The crate's `rex codebase` and `rex smells` helpers need that `cargo install`;
-without it, `grep -rn 'SMELL:' src/` does the same job.
+`.pre-commit-config.yaml` is committed but inert — its hooks need `pre-commit`,
+`gitleaks` and `trivy` on PATH, and nothing is installed. Until then `cargo fmt`,
+`cargo clippy --all-targets -- -D warnings` and `cargo test` are run by hand. To
+turn it on: `brew install pre-commit gitleaks trivy` then
+`pre-commit install --hook-type pre-commit --hook-type pre-push`.

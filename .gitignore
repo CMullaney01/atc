@@ -1,1 +1,5 @@
 /target
+
+# rex:ignore claude
+.claude/skills/
+.claude/settings.local.json
