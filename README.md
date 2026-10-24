@@ -173,8 +173,9 @@ ln -sfn "$PWD/target/release/atc" ~/.local/bin/atc   # anywhere on PATH
 echo 'source-file ~/dev/atc/tmux/atc.conf' >> ~/.tmux.conf
 tmux source-file ~/.tmux.conf
 
-# Claude Code: print the hook block and merge it into ~/.claude/settings.json
-atc install
+# agents: print the hook config for all four, or just one
+atc install                   # tmux config + every agent
+atc install --tool codex      # one agent, no tmux config
 atc doctor
 ```
 
@@ -190,13 +191,37 @@ the server was started. `atc doctor` will tell you if it isn't.
 | `atc status [--json]` | Report every tracked session |
 | `atc ui` | Open the command center |
 | `atc sync` | Refresh every window's glyphs (tmux runs this each redraw) |
+| `atc hook <Event> --tool <agent>` | Apply a hook from one of the four agents |
 | `atc state <status> [--title <t>]` | Report state for the current pane by hand |
 | `atc seen <pane-id>` | Drop a pane's escalation flag |
 | `atc ask <question>` | Ask Claude about the fleet |
 | `atc doctor` | Check the installation |
 | `atc install` | Print the tmux and hook configuration |
 
-## Anything that isn't Claude
+## The agents it knows
+
+Four, and each keeps its hooks somewhere different. `atc install --tool <name>`
+prints the right block for one of them.
+
+| Agent | Hook config | Read off its screen |
+|---|---|---|
+| `claude` | `~/.claude/settings.json` → `hooks` | working, blocked, waiting |
+| `codex` | `~/.codex/config.toml` → `features.hooks = true` + `[hooks]` | working, blocked |
+| `gemini` | `~/.gemini/settings.json` → `hooks` | blocked |
+| `copilot` | `~/.copilot/hooks/atc.json` | nothing |
+
+Hooks are the real mechanism and cover every state for all four. The last
+column is only the fallback for a session that started before atc was watching,
+and it is thinner for the others because their screen markers are quoted from
+their source rather than seen working — `atc doctor` says which is which.
+Copilot is closed source and publishes no screen text, so atc does not guess at
+it at all.
+
+Two gotchas worth knowing, both of which make a hook silently never run:
+gemini only runs hooks in folders you have **trusted**, and codex ignores a
+project-local `.codex/config.toml` unless the project is trusted.
+
+## Anything else
 
 `atc state` is the generic entry point, so any tool or long-running job can
 report in:

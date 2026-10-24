@@ -2,6 +2,7 @@
 //! tmux actually is, with a live view of whichever one is selected so you can
 //! read it without going there. It owns the terminal while it is open, so it
 //! puts the screen back before it moves the tmux client.
+use crate::agent::Tool;
 use crate::bar::TreeRow;
 use crate::pane::Kind;
 use crate::state::{self, Status, Subagent};
@@ -37,6 +38,7 @@ struct Item {
     active: bool,
     inferred: bool,
     subagents: Vec<Subagent>,
+    tool: Option<Tool>,
 }
 
 impl Item {
@@ -265,6 +267,7 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, Vec<Tree
             active: e.info.is_current(),
             inferred: e.is_inferred(),
             subagents: e.subagents().to_vec(),
+            tool: e.tool(),
         })
         .collect();
     (items, order, ai_count)
@@ -438,6 +441,10 @@ fn item_line(item: &Item, chosen: bool) -> Line<'static> {
             base.fg(Color::Indexed(244)),
         ),
         Span::styled(format!("{:<24} ", crop(&item.title, 24)), base),
+        Span::styled(
+            format!("{:<8} ", item.tool.map(|t| t.id()).unwrap_or("")),
+            base.fg(Color::Indexed(109)),
+        ),
         Span::styled(
             format!("{:<11} ", item.state_label()),
             Style::default().fg(item.colour()),
@@ -639,6 +646,7 @@ mod tests {
             repo: None,
             active: false,
             inferred: false,
+            tool: matches!(kind, Kind::Session | Kind::Unreported).then_some(Tool::Claude),
             subagents: (0..agents)
                 .map(|i| Subagent {
                     id: format!("a{i}"),

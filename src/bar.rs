@@ -1,5 +1,6 @@
 //! Builds the fleet row that tmux draws under the window list. tmux asks for it
 //! every couple of seconds, so this only ever formats values it is handed.
+use crate::agent::Tool;
 use crate::pane::{self, Kind};
 use crate::state::{PaneState, Status, Subagent};
 use crate::tmux::{self, escape_format, PaneInfo};
@@ -24,6 +25,14 @@ impl Entry<'_> {
     /// something the session said.
     pub(crate) fn is_inferred(&self) -> bool {
         self.state.is_none() && self.inferred.is_some()
+    }
+
+    /// Which agent this is: what the hook said if one has reported, otherwise
+    /// what the pane looks like. `None` for a pane that is not an agent.
+    pub(crate) fn tool(&self) -> Option<Tool> {
+        self.state
+            .and_then(|s| Tool::parse(&s.source))
+            .or_else(|| pane::detect_tool(self.info))
     }
 
     pub(crate) fn subagents(&self) -> &[Subagent] {
@@ -532,6 +541,23 @@ mod tests {
         let inv = inventory(std::slice::from_ref(&s), &panes);
         let row = render(&inv, Some("ws"), ai_only());
         assert!(row.contains("bold"), "row was: {row}");
+    }
+
+    #[test]
+    fn a_reported_agent_outranks_what_the_pane_looks_like() {
+        // The command says claude; the hook that reported said gemini.
+        let panes = [pane("%1", "ws", 0, "claude", 0, "2.1.308")];
+        let mut s = st("%1", Status::Working);
+        s.source = "gemini".to_string();
+        let inv = inventory(std::slice::from_ref(&s), &panes);
+        assert_eq!(inv[0].tool(), Some(Tool::Gemini));
+
+        // With nothing reported, detection answers instead.
+        let bare = inventory(&[], &panes);
+        assert_eq!(bare[0].tool(), Some(Tool::Claude));
+
+        let shell = [pane("%2", "ws", 0, "ws", 0, "zsh")];
+        assert_eq!(inventory(&[], &shell)[0].tool(), None);
     }
 
     #[test]
