@@ -23,6 +23,38 @@ pub(crate) enum Confidence {
     None,
 }
 
+/// One hook registration: the event as the tool spells it, and the matcher to
+/// pass back on the command line when the tool supports them.
+pub(crate) struct HookSpec {
+    pub(crate) event: &'static str,
+    pub(crate) kind: Option<&'static str>,
+}
+
+impl HookSpec {
+    const fn plain(event: &'static str) -> Self {
+        HookSpec { event, kind: None }
+    }
+
+    const fn matched(event: &'static str, kind: &'static str) -> Self {
+        HookSpec {
+            event,
+            kind: Some(kind),
+        }
+    }
+
+    /// The command to register, which is what atc will be invoked as.
+    pub(crate) fn command(&self, tool: Tool) -> String {
+        let mut out = format!("atc hook {}", self.event);
+        if tool != Tool::Claude {
+            out = format!("atc hook --tool {tool} {}", self.event);
+        }
+        if let Some(k) = self.kind {
+            out.push_str(&format!(" --kind {k}"));
+        }
+        out
+    }
+}
+
 /// What to look for on a pane's screen when no hook has reported it.
 pub(crate) struct Markers {
     /// Any one of these means the agent is working.
@@ -34,6 +66,66 @@ pub(crate) struct Markers {
     pub(crate) input: &'static [&'static str],
     pub(crate) confidence: Confidence,
 }
+
+/// Every hook atc registers, per tool: the event under the tool's own name,
+/// and the matcher to hand back so the handler knows which alert it was.
+///
+/// The installer and the normaliser both read these. They used to hold
+/// separate copies, which is how a hook came to be registered that nothing
+/// acted on — twice.
+const CLAUDE_HOOKS: &[HookSpec] = &[
+    HookSpec::plain("SessionStart"),
+    HookSpec::plain("UserPromptSubmit"),
+    HookSpec::plain("PreToolUse"),
+    HookSpec::plain("PostToolUse"),
+    HookSpec::plain("PostToolUseFailure"),
+    HookSpec::plain("PermissionRequest"),
+    HookSpec::plain("Stop"),
+    HookSpec::plain("StopFailure"),
+    HookSpec::plain("SessionEnd"),
+    HookSpec::plain("SubagentStart"),
+    HookSpec::plain("SubagentStop"),
+    HookSpec::matched("Notification", "permission_prompt"),
+    HookSpec::matched("Notification", "idle_prompt"),
+];
+
+/// Its documented set has no StopFailure or PostToolUseFailure.
+const CODEX_HOOKS: &[HookSpec] = &[
+    HookSpec::plain("SessionStart"),
+    HookSpec::plain("UserPromptSubmit"),
+    HookSpec::plain("PreToolUse"),
+    HookSpec::plain("PostToolUse"),
+    HookSpec::plain("PermissionRequest"),
+    HookSpec::plain("Stop"),
+    HookSpec::plain("SubagentStart"),
+    HookSpec::plain("SubagentStop"),
+    HookSpec::plain("SessionEnd"),
+];
+
+/// Gemini has no matchers, so which alert its Notification was comes from the
+/// payload instead.
+const GEMINI_HOOKS: &[HookSpec] = &[
+    HookSpec::plain("SessionStart"),
+    HookSpec::plain("BeforeAgent"),
+    HookSpec::plain("BeforeTool"),
+    HookSpec::plain("AfterTool"),
+    HookSpec::plain("AfterAgent"),
+    HookSpec::plain("Notification"),
+    HookSpec::plain("SessionEnd"),
+];
+
+const COPILOT_HOOKS: &[HookSpec] = &[
+    HookSpec::plain("sessionStart"),
+    HookSpec::plain("userPromptSubmitted"),
+    HookSpec::plain("preToolUse"),
+    HookSpec::plain("postToolUse"),
+    HookSpec::plain("postToolUseFailure"),
+    HookSpec::plain("permissionRequest"),
+    HookSpec::plain("agentStop"),
+    HookSpec::plain("sessionEnd"),
+    HookSpec::plain("subagentStart"),
+    HookSpec::plain("subagentStop"),
+];
 
 impl Tool {
     pub(crate) const ALL: [Tool; 4] = [Tool::Claude, Tool::Codex, Tool::Gemini, Tool::Copilot];
@@ -60,6 +152,21 @@ impl Tool {
             Tool::Codex => &["codex"],
             Tool::Gemini => &["gemini"],
             Tool::Copilot => &["copilot"],
+        }
+    }
+
+    /// Every hook atc registers for this tool: the event under the tool's own
+    /// name, and the matcher to hand back so the handler knows which it was.
+    ///
+    /// Both the installer and the normaliser read this one list. They used to
+    /// hold separate copies, which is how a hook came to be registered that
+    /// nothing acted on — twice.
+    pub(crate) fn hooks(self) -> &'static [HookSpec] {
+        match self {
+            Tool::Claude => CLAUDE_HOOKS,
+            Tool::Codex => CODEX_HOOKS,
+            Tool::Gemini => GEMINI_HOOKS,
+            Tool::Copilot => COPILOT_HOOKS,
         }
     }
 
