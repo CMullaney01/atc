@@ -2,7 +2,7 @@
 //! every couple of seconds, so this only ever formats values it is handed.
 use crate::pane::{self, Kind};
 use crate::state::{PaneState, Status, Subagent};
-use crate::tmux::{escape_format, PaneInfo};
+use crate::tmux::{self, escape_format, PaneInfo};
 use std::collections::{BTreeMap, HashMap};
 
 /// A live tmux pane, with hook state laid over it when there is any.
@@ -199,9 +199,42 @@ pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>) -> Vec<Tree
     out
 }
 
-fn styled(glyph: &str, colour: &str, stale: bool) -> String {
-    let weight = if stale { ",bold" } else { "" };
-    format!("#[fg={colour}{weight}]{glyph}")
+/// Whether the bar paints its own glyphs or leaves them in the status bar's
+/// colours. Off is a useful fallback for a bar whose styling the palette fights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Paint {
+    Colour,
+    Mono,
+}
+
+impl Paint {
+    pub(crate) fn from_tmux() -> Self {
+        Self::read(tmux::global_option("@atc_colour").as_deref())
+    }
+
+    /// Only an explicit refusal turns colour off, so an unset option behaves
+    /// the way it always has.
+    fn read(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("off" | "0" | "no" | "false") => Paint::Mono,
+            _ => Paint::Colour,
+        }
+    }
+
+    /// One glyph, dressed, and self-contained: whatever it turns on it turns
+    /// back off, so glyphs can be concatenated without bleeding into each other.
+    /// Weight carries urgency either way, so turning colour off loses the
+    /// state's hue but not the fact that it wants you.
+    fn apply(self, glyph: &str, colour: &str, stale: bool) -> String {
+        match self {
+            Paint::Colour => {
+                let weight = if stale { ",bold" } else { "" };
+                format!("#[fg={colour}{weight}]{glyph}#[default]")
+            }
+            Paint::Mono if stale => format!("#[bold]{glyph}#[default]"),
+            Paint::Mono => glyph.to_string(),
+        }
+    }
 }
 
 /// How much of the workspace the fleet row covers.
@@ -213,12 +246,18 @@ pub(crate) enum Scope {
     Everything,
 }
 
+/// How the row should be drawn.
+pub(crate) struct RowOpts {
+    pub(crate) scope: Scope,
+    pub(crate) paint: Paint,
+}
+
 /// The fleet row: one cluster per window, one glyph per pane.
-pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Scope) -> String {
+pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, opts: RowOpts) -> String {
     let mut groups: BTreeMap<GroupKey, (String, Vec<(u32, String)>)> = BTreeMap::new();
 
     for e in entries {
-        if scope == Scope::AiOnly && !e.kind.is_ai() {
+        if opts.scope == Scope::AiOnly && !e.kind.is_ai() {
             continue;
         }
         let info = e.info;
@@ -226,9 +265,10 @@ pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Sc
         let entry = groups
             .entry((is_other, info.session.clone(), info.window_index))
             .or_insert_with(|| (info.window_name.clone(), Vec::new()));
-        entry
-            .1
-            .push((info.pane_index, styled(e.glyph(), e.colour(), e.stale())));
+        entry.1.push((
+            info.pane_index,
+            opts.paint.apply(e.glyph(), e.colour(), e.stale()),
+        ));
     }
 
     let mut out = String::new();
@@ -263,32 +303,35 @@ pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Sc
     out
 }
 
-/// The aggregate glyph for one window, used for `@atc_win` on the window
-/// itself. Only panes with real state count: an unreported session has no
-/// urgency to contribute.
+/// Every AI pane in one window, as one glyph each in the order they sit on
+/// screen. This is what `@atc_win` holds, so tmux can draw it inside the window
+/// name for nothing.
 ///
-/// This one is drawn inside the user's own window list, so it sets no colour —
-/// shape says which state, weight says whether it wants you, and both stay
-/// readable whatever the status bar is styled with.
-pub(crate) fn window_glyph(
-    states: &[PaneState],
-    panes: &[PaneInfo],
+/// Non-AI panes stay out for the same reason they stay off the row: a glyph for
+/// every shell buries the one you are looking for. Returns `None` when a window
+/// holds no AI pane at all, so the option is unset rather than left blank.
+pub(crate) fn window_glyphs(
+    entries: &[Entry],
     session: &str,
     window_index: u32,
+    paint: Paint,
 ) -> Option<String> {
-    let in_window: Vec<&PaneInfo> = panes
+    let mut members: Vec<&Entry> = entries
         .iter()
-        .filter(|p| p.session == session && p.window_index == window_index)
+        .filter(|e| {
+            e.kind.is_ai() && e.info.session == session && e.info.window_index == window_index
+        })
         .collect();
-    let worst = states
-        .iter()
-        .filter(|st| in_window.iter().any(|p| p.pane_id == st.pane_id))
-        .max_by_key(|st| st.status.urgency())?;
-    let urgent = worst.stale || worst.status.urgency() >= Status::Waiting.urgency();
-    Some(match urgent {
-        true => format!("#[bold]{}#[default]", worst.status.glyph()),
-        false => worst.status.glyph().to_string(),
-    })
+    if members.is_empty() {
+        return None;
+    }
+    members.sort_by_key(|e| e.info.pane_index);
+    Some(
+        members
+            .iter()
+            .map(|e| paint.apply(e.glyph(), e.colour(), e.stale()))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -308,6 +351,20 @@ mod tests {
             title: String::new(),
             command: cmd.to_string(),
             path: "/tmp".to_string(),
+        }
+    }
+
+    fn ai_only() -> RowOpts {
+        RowOpts {
+            scope: Scope::AiOnly,
+            paint: Paint::Colour,
+        }
+    }
+
+    fn everything() -> RowOpts {
+        RowOpts {
+            scope: Scope::Everything,
+            paint: Paint::Colour,
         }
     }
 
@@ -393,7 +450,7 @@ mod tests {
             st("%3", Status::Waiting),
         ];
         let inv = inventory(&states, &panes);
-        let row = render(&inv, Some("ws"), Scope::AiOnly);
+        let row = render(&inv, Some("ws"), ai_only());
         assert!(row.contains("0:nvim"), "row was: {row}");
         assert!(row.contains("1:claude"));
         let zero = row.split("1:claude").next().unwrap();
@@ -407,7 +464,7 @@ mod tests {
         let states = vec![st("%1", Status::Waiting), st("%99", Status::Blocked)];
         let inv = inventory(&states, &panes);
         assert_eq!(inv.len(), 1, "only live panes appear");
-        let row = render(&inv, Some("ws"), Scope::AiOnly);
+        let row = render(&inv, Some("ws"), ai_only());
         assert!(!row.contains(Status::Blocked.glyph()), "row was: {row}");
     }
 
@@ -422,7 +479,7 @@ mod tests {
         let inv = inventory(&states, &panes);
 
         let quiet = Kind::Tool.colour();
-        let row = render(&inv, Some("ws"), Scope::AiOnly);
+        let row = render(&inv, Some("ws"), ai_only());
         assert!(row.contains(Status::Waiting.glyph()));
         assert_eq!(
             row.matches(quiet).count(),
@@ -430,7 +487,7 @@ mod tests {
             "tool/shell glyphs must not be on the default row: {row}"
         );
 
-        let full = render(&inv, Some("ws"), Scope::Everything);
+        let full = render(&inv, Some("ws"), everything());
         assert!(
             full.matches(quiet).count() >= 2,
             "nvim and zsh should both show with --all: {full}"
@@ -444,7 +501,7 @@ mod tests {
         let panes = [p];
         let inv = inventory(&[], &panes);
         assert_eq!(inv[0].kind, Kind::Unreported);
-        let row = render(&inv, Some("ws"), Scope::AiOnly);
+        let row = render(&inv, Some("ws"), ai_only());
         assert!(row.contains('?'), "row was: {row}");
     }
 
@@ -456,7 +513,7 @@ mod tests {
         ];
         let states = vec![st("%1", Status::Idle), st("%2", Status::Waiting)];
         let inv = inventory(&states, &panes);
-        let row = render(&inv, Some("ws"), Scope::AiOnly);
+        let row = render(&inv, Some("ws"), ai_only());
         let ws_at = row.find("3:claude").expect("current session present");
         let other_at = row.find("[other]").expect("other session present");
         assert!(ws_at < other_at, "current session must come first: {row}");
@@ -464,7 +521,7 @@ mod tests {
 
     #[test]
     fn empty_state_renders_an_empty_row() {
-        assert_eq!(render(&[], Some("ws"), Scope::AiOnly), "");
+        assert_eq!(render(&[], Some("ws"), ai_only()), "");
     }
 
     #[test]
@@ -473,25 +530,88 @@ mod tests {
         let mut s = st("%1", Status::Waiting);
         s.stale = true;
         let inv = inventory(std::slice::from_ref(&s), &panes);
-        let row = render(&inv, Some("ws"), Scope::AiOnly);
+        let row = render(&inv, Some("ws"), ai_only());
         assert!(row.contains("bold"), "row was: {row}");
     }
 
     #[test]
-    fn window_glyph_reports_the_most_urgent_pane() {
+    fn window_glyphs_follow_the_order_the_panes_sit_in() {
         let panes = vec![
-            pane("%1", "ws", 0, "claude", 0, "node"),
-            pane("%2", "ws", 0, "claude", 1, "node"),
+            pane("%2", "ws", 0, "claude", 1, "2.1.308"),
+            pane("%1", "ws", 0, "claude", 0, "2.1.308"),
         ];
         let states = vec![st("%1", Status::Working), st("%2", Status::Blocked)];
-        let g = window_glyph(&states, &panes, "ws", 0).expect("a glyph");
-        assert!(g.contains(Status::Blocked.glyph()), "glyph was: {g}");
+        let inv = inventory(&states, &panes);
+        let g = window_glyphs(&inv, "ws", 0, Paint::Colour).expect("a cluster");
+        let working = g.find(Status::Working.glyph()).expect("working present");
+        let blocked = g.find(Status::Blocked.glyph()).expect("blocked present");
+        assert!(working < blocked, "pane 0 before pane 1, got: {g}");
     }
 
     #[test]
-    fn window_glyph_is_none_when_nothing_is_tracked() {
-        let panes = vec![pane("%1", "ws", 0, "nvim", 0, "nvim")];
-        assert!(window_glyph(&[], &panes, "ws", 0).is_none());
+    fn window_glyphs_leave_out_everything_that_is_not_a_session() {
+        let panes = vec![
+            pane("%1", "ws", 0, "editor", 0, "nvim"),
+            pane("%2", "ws", 0, "editor", 1, "zsh"),
+            pane("%3", "ws", 0, "editor", 2, "cargo"),
+            pane("%4", "ws", 0, "editor", 3, "2.1.308"),
+        ];
+        let states = vec![st("%4", Status::Waiting)];
+        let inv = inventory(&states, &panes);
+        let g = window_glyphs(&inv, "ws", 0, Paint::Colour).expect("a cluster");
+        assert_eq!(
+            g.matches(Status::Waiting.glyph()).count(),
+            1,
+            "only the session should appear, got: {g}"
+        );
+        assert!(!g.contains(Kind::Tool.colour()), "nvim leaked in: {g}");
+        assert!(!g.contains(Kind::Job.colour()), "cargo leaked in: {g}");
+    }
+
+    #[test]
+    fn a_window_with_no_session_in_it_has_no_cluster() {
+        let panes = [pane("%1", "ws", 0, "editor", 0, "nvim")];
+        let inv = inventory(&[], &panes);
+        assert!(window_glyphs(&inv, "ws", 0, Paint::Colour).is_none());
+        assert!(window_glyphs(&inv, "ws", 9, Paint::Colour).is_none());
+    }
+
+    #[test]
+    fn a_session_known_only_from_its_screen_still_reaches_the_window() {
+        let panes = [pane("%1", "ws", 0, "claude", 0, "2.1.308")];
+        let mut inv = inventory(&[], &panes);
+        inv[0].inferred = Some(Status::Waiting);
+        let g = window_glyphs(&inv, "ws", 0, Paint::Colour).expect("a cluster");
+        assert!(g.contains(Status::Waiting.glyph()), "glyph was: {g}");
+    }
+
+    #[test]
+    fn turning_colour_off_keeps_the_glyph_and_the_weight() {
+        let panes = [pane("%1", "ws", 0, "claude", 0, "2.1.308")];
+        let mut s = st("%1", Status::Blocked);
+        s.stale = true;
+        let inv = inventory(std::slice::from_ref(&s), &panes);
+
+        let colour = window_glyphs(&inv, "ws", 0, Paint::Colour).expect("a cluster");
+        assert!(colour.contains("#[fg="), "should be painted: {colour}");
+
+        let mono = window_glyphs(&inv, "ws", 0, Paint::Mono).expect("a cluster");
+        assert!(!mono.contains("#[fg="), "should set no colour: {mono}");
+        assert!(mono.contains(Status::Blocked.glyph()), "glyph lost: {mono}");
+        assert!(
+            mono.contains("bold"),
+            "urgency lost with the colour: {mono}"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_refusal_turns_colour_off() {
+        for off in ["off", "0", "no", "false", " off "] {
+            assert_eq!(Paint::read(Some(off)), Paint::Mono, "{off:?}");
+        }
+        for on in [None, Some(""), Some("on"), Some("yes"), Some("anything")] {
+            assert_eq!(Paint::read(on), Paint::Colour, "{on:?}");
+        }
     }
 
     #[test]

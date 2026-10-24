@@ -21,6 +21,7 @@ usage:
   atc status [--json]                   report every tracked session
   atc state <status> [--title <t>]      report state for the current pane by hand
   atc ui                                open the command center
+  atc sync                              refresh every window's glyphs (tmux runs this)
   atc seen <pane-id>                    drop a pane's escalation flag
   atc doctor                            check the installation
   atc install                           print the tmux and hook configuration
@@ -41,6 +42,7 @@ fn main() {
         "state" => cmd_state(rest),
         "ui" => ui::run(),
         "seen" => cmd_seen(rest),
+        "sync" => cmd_sync(),
         "doctor" => cmd_doctor(),
         "install" => print!("{}", install_text()),
         "ask" => cmd_ask(rest),
@@ -137,6 +139,14 @@ fn cmd_hook(args: &[String]) {
 
 /// Window-level glyphs are read straight out of `@atc_win` by the status
 /// format, which costs nothing to draw but has to be recomputed here.
+fn write_window_glyphs(entries: &[bar::Entry], session: &str, window_index: u32) {
+    let target = format!("{session}:{window_index}");
+    match bar::window_glyphs(entries, session, window_index, bar::Paint::from_tmux()) {
+        Some(glyphs) => tmux::set_window_option(&target, "@atc_win", &glyphs),
+        None => tmux::unset_window_option(&target, "@atc_win"),
+    }
+}
+
 fn refresh_window_for(pane_id: &str) {
     let panes = tmux::list_panes();
     let live: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
@@ -144,19 +154,44 @@ fn refresh_window_for(pane_id: &str) {
     let Some(info) = panes.iter().find(|p| p.pane_id == pane_id) else {
         return;
     };
-    let target = format!("{}:{}", info.session, info.window_index);
     let states = state::all();
-    match bar::window_glyph(&states, &panes, &info.session, info.window_index) {
-        Some(glyph) => tmux::set_window_option(&target, "@atc_win", &glyph),
-        None => tmux::unset_window_option(&target, "@atc_win"),
+    let entries = bar::inventory(&states, &panes);
+    write_window_glyphs(&entries, &info.session, info.window_index);
+}
+
+/// Refreshes every window's glyphs, including the ones only a screen reading
+/// knows about. tmux runs this once per status redraw.
+///
+/// It deliberately does not call `tmux::refresh_client()`. Forcing a redraw
+/// would re-run the status line, which runs this again, for ever. Writing the
+/// options and letting the next redraw collect them is enough.
+fn cmd_sync() {
+    let panes = tmux::list_panes();
+    let live: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
+    state::prune(&live);
+    let states = state::all();
+    let mut entries = bar::inventory(&states, &panes);
+    infer::decorate(&mut entries);
+
+    let mut seen: Vec<(String, u32)> = panes
+        .iter()
+        .map(|p| (p.session.clone(), p.window_index))
+        .collect();
+    seen.sort();
+    seen.dedup();
+    for (session, window_index) in seen {
+        write_window_glyphs(&entries, &session, window_index);
     }
 }
 
 fn cmd_bar(args: &[String]) {
-    let scope = if args.iter().any(|a| a == "--all") {
-        bar::Scope::Everything
-    } else {
-        bar::Scope::AiOnly
+    let opts = bar::RowOpts {
+        scope: if args.iter().any(|a| a == "--all") {
+            bar::Scope::Everything
+        } else {
+            bar::Scope::AiOnly
+        },
+        paint: bar::Paint::from_tmux(),
     };
     let session = args
         .iter()
@@ -167,7 +202,7 @@ fn cmd_bar(args: &[String]) {
     let panes = tmux::list_panes();
     let mut inv = bar::inventory(&states, &panes);
     infer::decorate(&mut inv);
-    println!("{}", bar::render(&inv, session.as_deref(), scope));
+    println!("{}", bar::render(&inv, session.as_deref(), opts));
 }
 
 fn cmd_status(args: &[String]) {
