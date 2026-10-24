@@ -27,13 +27,15 @@ impl Status {
         }
     }
 
+    /// Drawn on the status bar, which is light unless you have restyled it, so
+    /// these are dark enough to read against it.
     pub(crate) fn colour(self) -> &'static str {
         match self {
-            Status::Idle => "colour244",
-            Status::Working => "colour75",
-            Status::Waiting => "colour208",
-            Status::Blocked => "colour171",
-            Status::Error => "colour196",
+            Status::Idle => "colour239",
+            Status::Working => "colour19",
+            Status::Waiting => "colour88",
+            Status::Blocked => "colour90",
+            Status::Error => "colour160",
         }
     }
 
