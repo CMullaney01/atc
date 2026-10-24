@@ -503,7 +503,7 @@ fn agent_install_text(tool: Tool) -> String {
     match tool {
         Tool::Claude => format!(
             "# claude — merge into the \"hooks\" object in ~/.claude/settings.json\n\n{}\n",
-            hooks_json()
+            hooks_json(Tool::Claude)
         ),
         Tool::Codex => format!(
             "# codex — add to ~/.codex/config.toml. The feature flag is required:\n\
@@ -514,120 +514,49 @@ fn agent_install_text(tool: Tool) -> String {
         Tool::Gemini => format!(
             "# gemini — merge into the \"hooks\" object in ~/.gemini/settings.json.\n\
              # Hooks run only in folders you have trusted.\n\n{}\n",
-            gemini_hooks_json()
+            hooks_json(Tool::Gemini)
         ),
         Tool::Copilot => format!(
             "# copilot — save as ~/.copilot/hooks/atc.json\n\n{}\n",
-            copilot_hooks_json()
+            hooks_json(Tool::Copilot)
         ),
     }
 }
 
-/// Codex names its events exactly as atc does, so only the format differs.
-/// Its documented set has no StopFailure or PostToolUseFailure, so those are
-/// left out rather than written into a config that would reject them.
+/// Codex takes TOML; the other three take JSON. Both read the one hook table
+/// per tool, so a registration cannot drift from what the handler acts on.
 fn codex_hooks_toml() -> String {
-    let events = [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "PermissionRequest",
-        "Stop",
-        "SubagentStart",
-        "SubagentStop",
-        "SessionEnd",
-    ];
     let mut out = String::from("features.hooks = true\n\n[hooks]\n");
-    for event in events {
+    for spec in Tool::Codex.hooks() {
         out.push_str(&format!(
-            "{event} = [{{ type = \"command\", command = \"atc hook --tool codex {event}\" }}]\n"
+            "{} = [{{ type = \"command\", command = \"{}\" }}]\n",
+            spec.event,
+            spec.command(Tool::Codex)
         ));
     }
     out
 }
 
-fn gemini_hooks_json() -> String {
-    let events = [
-        "SessionStart",
-        "BeforeAgent",
-        "BeforeTool",
-        "AfterTool",
-        "AfterAgent",
-        "Notification",
-        "SessionEnd",
-    ];
-    let body: Vec<String> = events
-        .iter()
-        .map(|e| {
-            format!(
-                "    \"{e}\": [\n      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook --tool gemini {e}\" }}] }}\n    ]"
-            )
-        })
-        .collect();
-    format!("{{\n  \"hooks\": {{\n{}\n  }}\n}}", body.join(",\n"))
-}
-
-fn copilot_hooks_json() -> String {
-    let events = [
-        "sessionStart",
-        "userPromptSubmitted",
-        "preToolUse",
-        "postToolUse",
-        "postToolUseFailure",
-        "permissionRequest",
-        "agentStop",
-        "sessionEnd",
-        "subagentStart",
-        "subagentStop",
-    ];
-    let body: Vec<String> = events
-        .iter()
-        .map(|e| {
-            format!(
-                "    \"{e}\": [\n      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook --tool copilot {e}\" }}] }}\n    ]"
-            )
-        })
-        .collect();
-    format!("{{\n  \"hooks\": {{\n{}\n  }}\n}}", body.join(",\n"))
-}
-
-fn hooks_json() -> String {
-    let events = [
-        ("SessionStart", None),
-        ("UserPromptSubmit", None),
-        ("PreToolUse", None),
-        ("PostToolUse", None),
-        ("PermissionRequest", None),
-        ("Stop", None),
-        ("StopFailure", None),
-        ("PostToolUseFailure", None),
-        ("SessionEnd", None),
-        ("SubagentStart", None),
-        ("SubagentStop", None),
-        ("Notification", Some("permission_prompt")),
-        ("Notification", Some("idle_prompt")),
-    ];
-    let mut out = String::from("{\n  \"hooks\": {\n");
-    let mut notification: Vec<String> = Vec::new();
-    let mut plain: Vec<String> = Vec::new();
-    for (event, kind) in events {
-        match kind {
-            Some(k) => notification.push(format!(
-                "      {{ \"matcher\": \"{k}\", \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook Notification --kind {k}\" }}] }}"
-            )),
-            None => plain.push(format!(
-                "    \"{event}\": [\n      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook {event}\" }}] }}\n    ]"
-            )),
-        }
+fn hooks_json(tool: Tool) -> String {
+    let mut by_event: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for spec in tool.hooks() {
+        let command = spec.command(tool);
+        let entry = match spec.kind {
+            Some(k) => format!(
+                "      {{ \"matcher\": \"{k}\", \"hooks\": [{{ \"type\": \"command\", \"command\": \"{command}\" }}] }}"
+            ),
+            None => format!(
+                "      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"{command}\" }}] }}"
+            ),
+        };
+        by_event.entry(spec.event).or_default().push(entry);
     }
-    plain.push(format!(
-        "    \"Notification\": [\n{}\n    ]",
-        notification.join(",\n")
-    ));
-    out.push_str(&plain.join(",\n"));
-    out.push_str("\n  }\n}");
-    out
+    let body: Vec<String> = by_event
+        .iter()
+        .map(|(event, entries)| format!("    \"{event}\": [\n{}\n    ]", entries.join(",\n")))
+        .collect();
+    format!("{{\n  \"hooks\": {{\n{}\n  }}\n}}", body.join(",\n"))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -679,10 +608,41 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_hook_is_one_the_handler_acts_on() {
+        for tool in Tool::ALL {
+            for spec in tool.hooks() {
+                let event = tool.normalise(spec.event).unwrap_or_else(|| {
+                    panic!("{tool} registers {} but nothing maps it", spec.event)
+                });
+                let mut input = HookInput::default();
+                if event.starts_with("Subagent") {
+                    input.agent_id = Some("a1".to_string());
+                }
+                if event == "Notification" && spec.kind.is_none() {
+                    input.notification_type = Some("ToolPermission".to_string());
+                }
+                let outcome = hook::apply(
+                    event,
+                    spec.kind,
+                    &input,
+                    "%1",
+                    Some(state::PaneState::new("%1")),
+                );
+                assert_ne!(
+                    outcome,
+                    Outcome::Ignore,
+                    "{tool} registers {} -> {event}, which the handler ignores",
+                    spec.event
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_agents_install_block_is_well_formed() {
         for (tool, text) in [
-            (Tool::Gemini, gemini_hooks_json()),
-            (Tool::Copilot, copilot_hooks_json()),
+            (Tool::Gemini, hooks_json(Tool::Gemini)),
+            (Tool::Copilot, hooks_json(Tool::Copilot)),
         ] {
             let v: serde_json::Value =
                 serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}"));
@@ -733,7 +693,8 @@ mod tests {
 
     #[test]
     fn generated_hooks_json_is_valid_and_covers_both_notification_matchers() {
-        let v: serde_json::Value = serde_json::from_str(&hooks_json()).expect("valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(&hooks_json(Tool::Claude)).expect("valid JSON");
         let hooks = &v["hooks"];
         assert!(hooks["Stop"].is_array());
         let notif = hooks["Notification"]

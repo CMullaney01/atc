@@ -22,6 +22,9 @@ pub(crate) struct HookInput {
     /// agents Claude Code runs internally.
     #[serde(default)]
     pub(crate) agent_type: Option<String>,
+    /// Which alert this is, for the agents that have no matchers to pass one.
+    #[serde(default)]
+    pub(crate) notification_type: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -136,8 +139,10 @@ pub(crate) fn apply(
         // Notification is an escalation signal only: permission_prompt lags the
         // real prompt by ~6s and idle_prompt by ~60s, so Stop and
         // PermissionRequest drive state and these just flag it as ignored.
-        "Notification" => match kind {
-            Some("permission_prompt") => {
+        // Gemini has no matchers, so it names the alert in the payload instead.
+        // Reading both means one arm serves every agent.
+        "Notification" => match kind.or(input.notification_type.as_deref()) {
+            Some("permission_prompt" | "ToolPermission") => {
                 mark_stale = true;
                 Some(Status::Blocked)
             }
