@@ -1,5 +1,6 @@
 //! Works out what is running in a pane when no hook has reported it. Without
 //! this, a session that atc was never told about would be invisible.
+use crate::agent::Tool;
 use crate::state::PaneState;
 use crate::tmux::PaneInfo;
 
@@ -85,6 +86,23 @@ fn titled_like_claude(title: &str) -> bool {
     title.trim_start().starts_with('✳')
 }
 
+/// Which agent a pane is running, going by what tmux reports about it. `None`
+/// for anything that is not one.
+///
+/// A title outlives the program that set it, so a pane an agent has exited
+/// still carries its mark while plainly being a shell again. The command wins
+/// wherever the two disagree.
+pub(crate) fn detect_tool(info: &PaneInfo) -> Option<Tool> {
+    let cmd = base_command(&info.command);
+    if let Some(t) = Tool::ALL.into_iter().find(|t| t.commands().contains(&cmd)) {
+        return Some(t);
+    }
+    if SHELLS.contains(&cmd) {
+        return None;
+    }
+    (looks_like_a_version(&info.command) || titled_like_claude(&info.title)).then_some(Tool::Claude)
+}
+
 /// The claude binary is named after its version, so a pane running it reports
 /// a command like "2.1.308" rather than anything recognisable.
 fn looks_like_a_version(cmd: &str) -> bool {
@@ -97,15 +115,10 @@ pub(crate) fn classify(info: &PaneInfo, state: Option<&PaneState>) -> Kind {
     if state.is_some() {
         return Kind::Session;
     }
-    let cmd = base_command(&info.command);
-    // A title outlives the program that set it, so a pane Claude Code has
-    // exited still says "✳" while plainly being a shell again. A running
-    // session never reports a shell as its command, so the command decides.
-    let back_to_a_shell = SHELLS.contains(&cmd);
-    if looks_like_a_version(&info.command) || (titled_like_claude(&info.title) && !back_to_a_shell)
-    {
+    if detect_tool(info).is_some() {
         return Kind::Unreported;
     }
+    let cmd = base_command(&info.command);
     if TOOLS.contains(&cmd) {
         Kind::Tool
     } else if SHELLS.contains(&cmd) {
@@ -174,6 +187,27 @@ mod tests {
         for cmd in ["cargo", "pytest", "make", "node"] {
             assert_eq!(classify(&pane("", cmd), None), Kind::Job, "{cmd}");
         }
+    }
+
+    #[test]
+    fn each_agent_is_recognised_by_its_command() {
+        for (cmd, want) in [
+            ("codex", Tool::Codex),
+            ("gemini", Tool::Gemini),
+            ("copilot", Tool::Copilot),
+            ("/opt/homebrew/bin/codex", Tool::Codex),
+            ("2.1.308", Tool::Claude),
+        ] {
+            assert_eq!(detect_tool(&pane("", cmd)), Some(want), "{cmd}");
+            assert_eq!(classify(&pane("", cmd), None), Kind::Unreported, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_shell_is_not_an_agent_whatever_its_title_says() {
+        assert_eq!(detect_tool(&pane("✳ Claude Code", "zsh")), None);
+        assert_eq!(detect_tool(&pane("", "nvim")), None);
+        assert_eq!(detect_tool(&pane("", "cargo")), None);
     }
 
     #[test]

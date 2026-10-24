@@ -1,5 +1,6 @@
 //! Every atc subcommand. The hook subcommand is the one that matters: it runs
 //! inside a live coding session, so it must never fail in a way the user sees.
+mod agent;
 mod bar;
 mod hook;
 mod infer;
@@ -8,6 +9,7 @@ mod state;
 mod tmux;
 mod ui;
 
+use agent::Tool;
 use hook::{HookInput, Outcome};
 use state::{PaneState, Status};
 use std::io::Read;
@@ -16,7 +18,8 @@ const USAGE: &str = "\
 atc — air traffic control for tmux AI sessions
 
 usage:
-  atc hook <Event> [--kind <matcher>]   apply a Claude Code hook (reads JSON on stdin)
+  atc hook <Event> [--tool <agent>]     apply an agent hook (reads JSON on stdin)
+            [--kind <matcher>]          agent is claude (default), codex, gemini or copilot
   atc bar [session] [--all]             render the fleet status row
   atc status [--json]                   report every tracked session
   atc state <status> [--title <t>]      report state for the current pane by hand
@@ -24,7 +27,7 @@ usage:
   atc sync                              refresh every window's glyphs (tmux runs this)
   atc seen <pane-id>                    drop a pane's escalation flag
   atc doctor                            check the installation
-  atc install                           print the tmux and hook configuration
+  atc install [--tool <agent>]                           print the tmux and hook configuration
   atc ask <question>                    ask Claude about the current fleet
 
 states: idle working waiting blocked error
@@ -44,7 +47,16 @@ fn main() {
         "seen" => cmd_seen(rest),
         "sync" => cmd_sync(),
         "doctor" => cmd_doctor(),
-        "install" => print!("{}", install_text()),
+        "install" => {
+            let only = flag(rest, "--tool").and_then(Tool::parse);
+            if let Some(name) = flag(rest, "--tool") {
+                if only.is_none() {
+                    eprintln!("atc install: unknown tool '{name}'");
+                    std::process::exit(2);
+                }
+            }
+            print!("{}", install_text(only));
+        }
         "ask" => cmd_ask(rest),
         "help" | "-h" | "--help" => print!("{USAGE}"),
         other => {
@@ -99,6 +111,19 @@ fn cmd_hook(args: &[String]) {
         return;
     };
     let kind = flag(args, "--kind");
+    let tool = match flag(args, "--tool") {
+        Some(name) => match Tool::parse(name) {
+            Some(t) => t,
+            None => {
+                log(&format!("hook called with unknown tool '{name}'"));
+                return;
+            }
+        },
+        None => Tool::Claude,
+    };
+    let Some(event) = tool.normalise(event) else {
+        return; // an event this agent has that atc has no use for
+    };
 
     let Some(pane_id) = tmux::current_pane() else {
         return; // not running under tmux; nothing to report to
@@ -113,7 +138,8 @@ fn cmd_hook(args: &[String]) {
     let prev = state::load(&pane_id);
     let was = prev.as_ref().map(|p| (p.status, p.stale));
     match hook::apply(event, kind, &input, &pane_id, prev) {
-        Outcome::Update(st) => {
+        Outcome::Update(mut st) => {
+            st.source = tool.id().to_string();
             if let Err(e) = state::save(&st) {
                 log(&format!("could not save state for {pane_id}: {e}"));
             }
@@ -387,6 +413,18 @@ fn cmd_doctor() {
     let tracked = state::all().len();
     println!("ok    {tracked} tracked pane(s)");
 
+    // Screen reading is a fallback for sessions that never fired a hook, and
+    // how much to trust it differs per agent. Say so rather than let a guess
+    // look like a report.
+    for tool in Tool::ALL {
+        let note = match tool.markers().confidence {
+            agent::Confidence::Seen => "screen rules checked against a live session",
+            agent::Confidence::FromSource => "screen rules taken from its source, never run",
+            agent::Confidence::None => "no screen rules — relies on its hooks alone",
+        };
+        println!("      {:<8} {note}", tool.id());
+    }
+
     if problems > 0 {
         std::process::exit(1);
     }
@@ -441,13 +479,117 @@ fn cmd_ask(args: &[String]) {
     }
 }
 
-fn install_text() -> String {
-    format!(
-        "# 1. tmux — source this, or copy it into your tmux.conf\n\n{}\n\
-         # 2. ~/.claude/settings.json — merge into the existing \"hooks\" object\n\n{}\n",
-        include_str!("../tmux/atc.conf"),
-        hooks_json()
-    )
+fn install_text(only: Option<Tool>) -> String {
+    let mut out = String::new();
+    if only.is_none() {
+        out.push_str(&format!(
+            "# tmux — source this, or copy it into your tmux.conf\n\n{}\n",
+            include_str!("../tmux/atc.conf")
+        ));
+    }
+    for tool in Tool::ALL {
+        if only.is_some_and(|t| t != tool) {
+            continue;
+        }
+        out.push_str(&agent_install_text(tool));
+        out.push('\n');
+    }
+    out
+}
+
+/// Each agent keeps its hooks somewhere different and in a different format,
+/// so this is four separate snippets rather than one with the paths swapped.
+fn agent_install_text(tool: Tool) -> String {
+    match tool {
+        Tool::Claude => format!(
+            "# claude — merge into the \"hooks\" object in ~/.claude/settings.json\n\n{}\n",
+            hooks_json()
+        ),
+        Tool::Codex => format!(
+            "# codex — add to ~/.codex/config.toml. The feature flag is required:\n\
+             # without it the [hooks] table is ignored and codex panes stay unknown.\n\
+             # A project .codex/config.toml is only read for a trusted project.\n\n{}\n",
+            codex_hooks_toml()
+        ),
+        Tool::Gemini => format!(
+            "# gemini — merge into the \"hooks\" object in ~/.gemini/settings.json.\n\
+             # Hooks run only in folders you have trusted.\n\n{}\n",
+            gemini_hooks_json()
+        ),
+        Tool::Copilot => format!(
+            "# copilot — save as ~/.copilot/hooks/atc.json\n\n{}\n",
+            copilot_hooks_json()
+        ),
+    }
+}
+
+/// Codex names its events exactly as atc does, so only the format differs.
+/// Its documented set has no StopFailure or PostToolUseFailure, so those are
+/// left out rather than written into a config that would reject them.
+fn codex_hooks_toml() -> String {
+    let events = [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PermissionRequest",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "SessionEnd",
+    ];
+    let mut out = String::from("features.hooks = true\n\n[hooks]\n");
+    for event in events {
+        out.push_str(&format!(
+            "{event} = [{{ type = \"command\", command = \"atc hook --tool codex {event}\" }}]\n"
+        ));
+    }
+    out
+}
+
+fn gemini_hooks_json() -> String {
+    let events = [
+        "SessionStart",
+        "BeforeAgent",
+        "BeforeTool",
+        "AfterTool",
+        "AfterAgent",
+        "Notification",
+        "SessionEnd",
+    ];
+    let body: Vec<String> = events
+        .iter()
+        .map(|e| {
+            format!(
+                "    \"{e}\": [\n      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook --tool gemini {e}\" }}] }}\n    ]"
+            )
+        })
+        .collect();
+    format!("{{\n  \"hooks\": {{\n{}\n  }}\n}}", body.join(",\n"))
+}
+
+fn copilot_hooks_json() -> String {
+    let events = [
+        "sessionStart",
+        "userPromptSubmitted",
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "permissionRequest",
+        "agentStop",
+        "sessionEnd",
+        "subagentStart",
+        "subagentStop",
+    ];
+    let body: Vec<String> = events
+        .iter()
+        .map(|e| {
+            format!(
+                "    \"{e}\": [\n      {{ \"hooks\": [{{ \"type\": \"command\", \"command\": \"atc hook --tool copilot {e}\" }}] }}\n    ]"
+            )
+        })
+        .collect();
+    format!("{{\n  \"hooks\": {{\n{}\n  }}\n}}", body.join(",\n"))
 }
 
 fn hooks_json() -> String {
@@ -534,6 +676,59 @@ mod tests {
             .collect();
         assert_eq!(flag(&args, "--kind"), Some("idle_prompt"));
         assert_eq!(flag(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn every_agents_install_block_is_well_formed() {
+        for (tool, text) in [
+            (Tool::Gemini, gemini_hooks_json()),
+            (Tool::Copilot, copilot_hooks_json()),
+        ] {
+            let v: serde_json::Value =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            let hooks = v["hooks"].as_object().expect("a hooks object");
+            assert!(!hooks.is_empty(), "{tool} registered nothing");
+            for (event, entries) in hooks {
+                let cmd = entries[0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{tool}/{event} has no command"));
+                assert!(
+                    cmd.contains(&format!("--tool {tool}")) && cmd.ends_with(event),
+                    "{tool}/{event} command is wrong: {cmd}"
+                );
+            }
+        }
+
+        // Codex is TOML, so it is checked by shape: the feature flag it needs,
+        // and one line per event naming that event.
+        let toml = codex_hooks_toml();
+        assert!(
+            toml.starts_with("features.hooks = true"),
+            "the flag must lead, or the table below it is ignored"
+        );
+        for line in toml.lines().skip(3).filter(|l| !l.is_empty()) {
+            let (event, rest) = line.split_once(" = ").expect("an assignment");
+            assert!(
+                rest.contains(&format!("atc hook --tool codex {event}")),
+                "codex/{event} is wired to the wrong command: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn asking_for_one_agent_prints_only_that_agent() {
+        let only = install_text(Some(Tool::Gemini));
+        assert!(only.contains("~/.gemini/settings.json"));
+        assert!(!only.contains("~/.codex/config.toml"));
+        assert!(
+            !only.contains("status-left"),
+            "a single agent needs no tmux config"
+        );
+
+        let all = install_text(None);
+        for tool in Tool::ALL {
+            assert!(all.contains(&format!("# {tool} —")), "{tool} missing");
+        }
     }
 
     #[test]
