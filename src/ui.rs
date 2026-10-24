@@ -486,12 +486,7 @@ fn draw_preview(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
         .preview
         .tail(height)
         .iter()
-        .map(|l| {
-            Line::from(Span::styled(
-                l.clone(),
-                Style::default().fg(Color::Indexed(250)),
-            ))
-        })
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(Color::Reset))))
         .collect();
     f.render_widget(
         Paragraph::new(body).block(

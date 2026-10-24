@@ -168,6 +168,10 @@ pub(crate) fn render(entries: &[Entry], current_session: Option<&str>, scope: Sc
 /// The aggregate glyph for one window, used for `@atc_win` on the window
 /// itself. Only panes with real state count: an unreported session has no
 /// urgency to contribute.
+///
+/// This one is drawn inside the user's own window list, so it sets no colour —
+/// shape says which state, weight says whether it wants you, and both stay
+/// readable whatever the status bar is styled with.
 pub(crate) fn window_glyph(
     states: &[PaneState],
     panes: &[PaneInfo],
@@ -182,7 +186,11 @@ pub(crate) fn window_glyph(
         .iter()
         .filter(|st| in_window.iter().any(|p| p.pane_id == st.pane_id))
         .max_by_key(|st| st.status.urgency())?;
-    Some(styled(worst.status.glyph(), worst.status.colour(), worst.stale) + "#[default]")
+    let urgent = worst.stale || worst.status.urgency() >= Status::Waiting.urgency();
+    Some(match urgent {
+        true => format!("#[bold]{}#[default]", worst.status.glyph()),
+        false => worst.status.glyph().to_string(),
+    })
 }
 
 #[cfg(test)]
