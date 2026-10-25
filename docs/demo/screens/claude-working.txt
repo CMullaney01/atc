@@ -1,0 +1,29 @@
+> add a --tool flag to `atc state` so a wrapper script can report as any agent
+
+● I'll thread it through cmd_state into PaneState.source, the same field the
+  hooks already set. Reading the two call sites first.
+
+  Read   src/main.rs (750 lines)
+  Read   src/state.rs (307 lines)
+
+● cmd_state hardcodes "manual" as the source. The flag can override it, and
+  Tool::parse already rejects anything that isn't one of the four.
+
+  Edit   src/main.rs
+         +  let source = flag(args, "--tool")
+         +      .and_then(Tool::parse)
+         +      .map_or("manual", Tool::id);
+
+  Edit   src/main.rs
+         +  st.source = source.to_string();
+
+● Now a test. An unknown name has to be rejected rather than silently
+  written, or a typo in a wrapper script becomes a tool nobody can see.
+
+  Edit   src/main.rs
+         +  #[test]
+         +  fn an_unknown_tool_is_refused_rather_than_stored() {
+
+  Bash   cargo test --quiet
+         running 99 tests
+         ...................................................................

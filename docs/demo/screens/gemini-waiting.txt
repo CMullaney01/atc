@@ -1,0 +1,11 @@
+  ✦ I've split the rate limiter into its own module.
+
+    The token bucket now refills on read rather than on a timer, so
+    there is no background task to shut down and the tests do not
+    need to sleep.
+
+    - src/limit.rs     new, 94 lines
+    - src/client.rs    -31 lines
+    - tests/limit.rs   6 cases
+
+    All six pass. Anything else before I open the PR?

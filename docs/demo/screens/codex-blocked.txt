@@ -1,0 +1,12 @@
+  thinking   the lint config lives in pyproject.toml, not setup.cfg
+
+  I need to see what is actually failing before changing any rules —
+  the ignore list has grown and some of it is probably dead.
+
+  ┌ Shell ──────────────────────────────────────────────────┐
+  │ ruff check --statistics src/                             │
+  │                                                          │
+  │ > 1. Yes, proceed                                        │
+  │   2. Yes, and don't ask again for ruff                   │
+  │   3. No, tell codex what to do differently               │
+  └──────────────────────────────────────────────────────────┘

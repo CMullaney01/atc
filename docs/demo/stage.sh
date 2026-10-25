@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Builds the fleet the README screenshots are taken of: two tmux sessions, all
+# four agents, each one's state written by its own real hook rather than faked.
+#
+# Runs on its own tmux socket, so recording this cannot disturb a live session.
+# Anything inside a pane inherits that socket through $TMUX, which is why atc
+# reports on the demo fleet and not on the real one.
+set -euo pipefail
+
+REPO=${REPO:-$HOME/dev/atc}
+ATC=${ATC:-$REPO/target/release/atc}
+HERE=$REPO/docs/demo
+SOCKET=atcdemo
+TM="tmux -L $SOCKET"
+AGENT="$HERE/agent.sh"
+
+# Its own state directory, which matters more than it looks. State is keyed by
+# tmux pane id, and ids are per-server, so the real server's status bar prunes
+# every file it does not recognise -- including this fleet's, mid-recording.
+export ATC_STATE_DIR=${ATC_STATE_DIR:-${TMPDIR:-/tmp}/atc-demo-state}
+export ATC
+rm -rf "$ATC_STATE_DIR"
+mkdir -p "$ATC_STATE_DIR"
+
+$TM kill-server 2>/dev/null || true
+sleep 0.3
+
+agent() { # <target> <tool> <title> <screen> <event>...
+    local target=$1
+    shift
+    $TM respawn-pane -k -t "$target" "$AGENT $*"
+}
+
+# The server inherits the exported variable, so its status bar and every pane
+# it spawns read the same isolated state.
+$TM -f "$HERE/demo.conf" new-session -d -s myworkspace -n editor -c "$REPO" -x 200 -y 50
+$TM set-environment -g ATC_STATE_DIR "$ATC_STATE_DIR"
+
+# A real editor and a real git TUI, so the rows atc calls "tool" are genuinely
+# that rather than something dressed up as one.
+$TM send-keys -t myworkspace:editor "nvim src/process.rs" Enter
+$TM split-window -h -t myworkspace:editor -c "$REPO"
+# A genuinely long build: a cold target directory, so every dependency is
+# compiled and the job is still running when the recording ends. atc spots a
+# job in a shell pane with no instrumentation at all, and this is that.
+BUILD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/atc-demo-build.XXXXXX")
+# Single-threaded on purpose: a parallel cold build finishes in fifteen
+# seconds, which is not long enough to still be a job when the shutter opens.
+$TM send-keys -t myworkspace:editor.1 \
+    "cargo build --release -j 1 --target-dir $BUILD_DIR" Enter
+
+$TM new-window -d -t myworkspace -n atc -c "$REPO"
+$TM split-window -h -t myworkspace:atc -c "$HOME/dev/clitools"
+agent myworkspace:atc.0 claude add-tool-flag claude-working.txt SessionStart UserPromptSubmit PreToolUse
+agent myworkspace:atc.1 claude fix-pyright-lint claude-waiting.txt SessionStart Stop
+
+$TM new-window -d -t myworkspace -n review -c "$HOME/dev/pa"
+$TM split-window -h -t myworkspace:review -c "$HOME/dev/aeron-cgo"
+$TM split-window -v -t myworkspace:review.1 -c "$HOME/dev/dotfiles"
+agent myworkspace:review.0 codex lint-config codex-blocked.txt SessionStart PermissionRequest
+agent myworkspace:review.1 gemini rate-limits gemini-waiting.txt SessionStart AfterAgent
+agent myworkspace:review.2 copilot k9s-aliases copilot-working.txt sessionStart preToolUse
+
+# A second session, so the command center has more than one to group by. This
+# one's claude has been waiting long enough to be escalated, which is the bold
+# "you have been ignoring this" weight on the row.
+$TM new-session -d -s dotfiles -n k9s -c "$HOME/dev/dotfiles"
+$TM send-keys -t dotfiles:k9s "lazygit" Enter
+$TM split-window -h -t dotfiles:k9s -c "$HOME/dev/dotfiles"
+agent dotfiles:k9s.1 claude add-k9s-dotfiles claude-waiting.txt \
+    SessionStart Stop Notification:idle_prompt
+
+sleep 1
+$TM select-window -t myworkspace:atc
+$TM select-pane -t myworkspace:atc.0
+# Through the server, so sync talks to this socket rather than the real one.
+$TM run-shell "$ATC sync"
+echo "staged: $($TM list-panes -a | wc -l | tr -d ' ') panes, state in $ATC_STATE_DIR"

@@ -1,0 +1,8 @@
+  ● Working on: add the k9s aliases to the dotfiles
+
+    ✓ read dotfiles/k9s/config.yaml
+    ✓ read dotfiles/README.md
+    ⠹ editing dotfiles/k9s/aliases.yaml
+
+    The ctrl-a passthrough note belongs in the README as well,
+    since that is the one shortcut k9s and tmux fight over.
