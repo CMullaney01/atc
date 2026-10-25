@@ -5,6 +5,7 @@ mod bar;
 mod hook;
 mod infer;
 mod pane;
+mod proc;
 mod state;
 mod tmux;
 mod ui;
@@ -435,27 +436,46 @@ fn check_state_dir() -> u32 {
 /// Only Claude's settings file is checked. The other three keep their hooks
 /// elsewhere and in their own formats, and a missing one is not a problem
 /// unless you use that agent.
+/// Every installed agent, and whether atc's hooks are actually registered
+/// with it. Checking only claude is how three quarters of a fleet came to be
+/// silently unreported.
 fn check_hooks() -> u32 {
-    let settings = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".claude/settings.json"))
-        .unwrap_or_default();
-    match std::fs::read_to_string(&settings) {
-        Ok(body) if body.contains("atc hook") => {
-            println!("ok    hooks registered in {}", settings.display());
+    Tool::ALL.into_iter().map(check_hooks_for).sum()
+}
+
+fn check_hooks_for(tool: Tool) -> u32 {
+    let shown = tool.config_path();
+    if !proc::on_path(tool.id()) {
+        println!("      {:<8} not installed", tool.id());
+        return 0;
+    }
+    match expand_home(shown).map(std::fs::read_to_string) {
+        Some(Ok(body)) if body.contains("atc hook") => {
+            println!("ok    {:<8} hooks registered in {shown}", tool.id());
             0
         }
-        Ok(_) => {
+        Some(Ok(_)) => {
             println!(
-                "WARN  no 'atc hook' entries in {} — run 'atc install'",
-                settings.display()
+                "WARN  {:<8} no 'atc hook' in {shown} — run 'atc install --tool {}'",
+                tool.id(),
+                tool.id()
             );
             1
         }
-        Err(e) => {
-            println!("WARN  cannot read {}: {e}", settings.display());
+        _ => {
+            println!(
+                "WARN  {:<8} no {shown} — run 'atc install --tool {}'",
+                tool.id(),
+                tool.id()
+            );
             1
         }
     }
+}
+
+fn expand_home(path: &str) -> Option<std::path::PathBuf> {
+    let rest = path.strip_prefix("~/")?;
+    Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(rest))
 }
 
 /// Screen reading is a fallback for sessions that never fired a hook, and how
@@ -544,22 +564,26 @@ fn install_text(only: Option<Tool>) -> String {
 fn agent_install_text(tool: Tool) -> String {
     match tool {
         Tool::Claude => format!(
-            "# claude — merge into the \"hooks\" object in ~/.claude/settings.json\n\n{}\n",
+            "# claude — merge into the \"hooks\" object in {}\n\n{}\n",
+            Tool::Claude.config_path(),
             hooks_json(Tool::Claude)
         ),
         Tool::Codex => format!(
-            "# codex — add to ~/.codex/config.toml. The feature flag is required:\n\
+            "# codex — add to {}. The feature flag is required:\n\
              # without it the [hooks] table is ignored and codex panes stay unknown.\n\
              # A project .codex/config.toml is only read for a trusted project.\n\n{}\n",
+            Tool::Codex.config_path(),
             codex_hooks_toml()
         ),
         Tool::Gemini => format!(
-            "# gemini — merge into the \"hooks\" object in ~/.gemini/settings.json.\n\
+            "# gemini — merge into the \"hooks\" object in {}.\n\
              # Hooks run only in folders you have trusted.\n\n{}\n",
+            Tool::Gemini.config_path(),
             hooks_json(Tool::Gemini)
         ),
         Tool::Copilot => format!(
-            "# copilot — save as ~/.copilot/hooks/atc.json\n\n{}\n",
+            "# copilot — save as {}\n\n{}\n",
+            Tool::Copilot.config_path(),
             hooks_json(Tool::Copilot)
         ),
     }

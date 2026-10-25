@@ -1,5 +1,6 @@
 //! The only place that shells out to tmux. Everything else works on the values
 //! this hands back, so the rest of atc can be tested with no tmux server.
+use crate::proc;
 use std::process::Command;
 
 const SEP: char = '\u{1f}';
@@ -17,6 +18,11 @@ pub(crate) struct PaneInfo {
     pub(crate) title: String,
     pub(crate) command: String,
     pub(crate) path: String,
+    /// Without the "/dev/" prefix, which is how `ps` reports it.
+    pub(crate) tty: String,
+    /// The full command line, but only for a pane running an interpreter —
+    /// empty for every other pane, since nothing else needs it.
+    pub(crate) argv: String,
 }
 
 impl PaneInfo {
@@ -53,18 +59,37 @@ pub(crate) fn list_panes() -> Vec<PaneInfo> {
         "#{{pane_id}}{s}#{{session_name}}{s}#{{window_index}}{s}#{{window_name}}{s}\
          #{{pane_index}}{s}#{{?pane_active,1,0}}{s}#{{?window_active,1,0}}{s}\
          #{{?session_attached,1,0}}{s}#{{pane_title}}{s}\
-         #{{pane_current_command}}{s}#{{pane_current_path}}",
+         #{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_tty}}",
         s = SEP
     );
     let Some(out) = run(&["list-panes", "-a", "-F", &fmt]) else {
         return Vec::new();
     };
-    out.lines().filter_map(parse_pane_line).collect()
+    let mut panes: Vec<PaneInfo> = out.lines().filter_map(parse_pane_line).collect();
+    fill_command_lines(&mut panes);
+    panes
+}
+
+/// An agent installed from npm runs as `node`, so its pane says nothing about
+/// which agent it is. Read the command line of those panes, and only those.
+fn fill_command_lines(panes: &mut [PaneInfo]) {
+    if !panes
+        .iter()
+        .any(|p| proc::is_interpreter(proc::base_command(&p.command)))
+    {
+        return;
+    }
+    let lines = proc::command_lines();
+    for pane in panes.iter_mut() {
+        if let Some(argv) = lines.get(&pane.tty) {
+            pane.argv = argv.clone();
+        }
+    }
 }
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() < 11 {
+    if f.len() < 12 {
         return None;
     }
     Some(PaneInfo {
@@ -79,6 +104,8 @@ fn parse_pane_line(line: &str) -> Option<PaneInfo> {
         title: f[8].to_string(),
         command: f[9].to_string(),
         path: f[10].to_string(),
+        tty: f[11].trim_start_matches("/dev/").to_string(),
+        argv: String::new(),
     })
 }
 
@@ -199,7 +226,8 @@ mod tests {
     #[test]
     fn parses_a_pane_line() {
         let line = format!(
-            "%6{s}myworkspace{s}0{s}nvim{s}1{s}1{s}1{s}1{s}✳ fix-lint{s}2.1.308{s}/Users/c/dev/atc",
+            "%6{s}myworkspace{s}0{s}nvim{s}1{s}1{s}1{s}1{s}✳ fix-lint{s}2.1.308\
+             {s}/Users/c/dev/atc{s}/dev/ttys004",
             s = SEP
         );
         let p = parse_pane_line(&line).expect("should parse");
@@ -215,12 +243,15 @@ mod tests {
         assert_eq!(p.address(), "0.1");
         assert_eq!(p.command, "2.1.308");
         assert_eq!(p.path, "/Users/c/dev/atc");
+        // Stored the way `ps` reports it, so a pane can be matched to its
+        // process without re-trimming at every use.
+        assert_eq!(p.tty, "ttys004");
     }
 
     #[test]
     fn an_active_pane_in_a_background_window_is_not_current() {
         let line = format!(
-            "%9{s}ws{s}2{s}other{s}0{s}1{s}0{s}1{s}title{s}zsh{s}/tmp",
+            "%9{s}ws{s}2{s}other{s}0{s}1{s}0{s}1{s}title{s}zsh{s}/tmp{s}/dev/ttys009",
             s = SEP
         );
         let p = parse_pane_line(&line).expect("should parse");

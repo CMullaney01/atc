@@ -155,6 +155,17 @@ impl Tool {
         }
     }
 
+    /// Where this tool keeps the hooks atc registers. The installer prints it
+    /// and `atc doctor` reads it, so the two cannot name different files.
+    pub(crate) fn config_path(self) -> &'static str {
+        match self {
+            Tool::Claude => "~/.claude/settings.json",
+            Tool::Codex => "~/.codex/config.toml",
+            Tool::Gemini => "~/.gemini/settings.json",
+            Tool::Copilot => "~/.copilot/hooks/atc.json",
+        }
+    }
+
     /// Every hook atc registers for this tool: the event under the tool's own
     /// name, and the matcher to hand back so the handler knows which it was.
     ///

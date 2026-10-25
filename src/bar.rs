@@ -382,6 +382,8 @@ mod tests {
             title: String::new(),
             command: cmd.to_string(),
             path: "/tmp".to_string(),
+            tty: "ttys001".to_string(),
+            argv: String::new(),
         }
     }
 

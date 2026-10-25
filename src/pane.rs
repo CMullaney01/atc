@@ -1,6 +1,7 @@
 //! Works out what is running in a pane when no hook has reported it. Without
 //! this, a session that atc was never told about would be invisible.
 use crate::agent::Tool;
+use crate::proc::{base_command, is_interpreter, tool_from_argv};
 use crate::state::PaneState;
 use crate::tmux::PaneInfo;
 
@@ -72,15 +73,6 @@ impl Kind {
     }
 }
 
-/// tmux reports a bare command name, but be tolerant of paths and the leading
-/// dash a login shell carries.
-fn base_command(cmd: &str) -> &str {
-    cmd.rsplit('/')
-        .next()
-        .unwrap_or(cmd)
-        .trim_start_matches('-')
-}
-
 /// Claude Code decorates its pane title with "✳".
 fn titled_like_claude(title: &str) -> bool {
     title.trim_start().starts_with('✳')
@@ -96,6 +88,12 @@ pub(crate) fn detect_tool(info: &PaneInfo) -> Option<Tool> {
     let cmd = base_command(&info.command);
     if let Some(t) = Tool::ALL.into_iter().find(|t| t.commands().contains(&cmd)) {
         return Some(t);
+    }
+    // gemini and copilot are npm packages, so tmux reports them as `node` and
+    // they used to land on the status row as ordinary jobs. Their command line
+    // is the only thing that says which agent they are.
+    if is_interpreter(cmd) {
+        return tool_from_argv(&info.argv);
     }
     if SHELLS.contains(&cmd) {
         return None;
@@ -145,6 +143,15 @@ mod tests {
             title: title.to_string(),
             command: command.to_string(),
             path: "/tmp".to_string(),
+            tty: "ttys001".to_string(),
+            argv: String::new(),
+        }
+    }
+
+    fn node_pane(argv: &str) -> PaneInfo {
+        PaneInfo {
+            argv: argv.to_string(),
+            ..pane("", "node")
         }
     }
 
@@ -184,7 +191,7 @@ mod tests {
 
     #[test]
     fn anything_else_in_a_pane_is_a_running_job() {
-        for cmd in ["cargo", "pytest", "make", "node"] {
+        for cmd in ["cargo", "pytest", "make"] {
             assert_eq!(classify(&pane("", cmd), None), Kind::Job, "{cmd}");
         }
     }
@@ -208,6 +215,29 @@ mod tests {
         assert_eq!(detect_tool(&pane("✳ Claude Code", "zsh")), None);
         assert_eq!(detect_tool(&pane("", "nvim")), None);
         assert_eq!(detect_tool(&pane("", "cargo")), None);
+    }
+
+    #[test]
+    fn an_agent_running_under_node_is_still_an_agent() {
+        // The bug this guards: gemini and copilot report `node` to tmux, so
+        // they were classified as jobs and left off the status row entirely.
+        let gemini = node_pane("node /opt/lib/node_modules/@google/gemini-cli/dist/index.js");
+        assert_eq!(detect_tool(&gemini), Some(Tool::Gemini));
+        assert_eq!(classify(&gemini, None), Kind::Unreported);
+
+        let copilot = node_pane("node /opt/lib/node_modules/@github/copilot/index.js");
+        assert_eq!(detect_tool(&copilot), Some(Tool::Copilot));
+        assert_eq!(classify(&copilot, None), Kind::Unreported);
+    }
+
+    #[test]
+    fn an_ordinary_node_process_is_still_a_job() {
+        let build = node_pane("node /Users/me/dev/site/build.js");
+        assert_eq!(detect_tool(&build), None);
+        assert_eq!(classify(&build, None), Kind::Job);
+        // No command line read at all, which is every pane that is not an
+        // interpreter: nothing to go on, so still a job.
+        assert_eq!(classify(&pane("", "node"), None), Kind::Job);
     }
 
     #[test]
