@@ -5,7 +5,7 @@ mod bar;
 mod hook;
 mod infer;
 mod pane;
-mod proc;
+mod process;
 mod state;
 mod tmux;
 mod ui;
@@ -462,7 +462,7 @@ fn check_hooks() -> u32 {
 
 fn check_hooks_for(tool: Tool) -> u32 {
     let shown = tool.config_path();
-    if !proc::on_path(tool.id()) {
+    if !process::on_path(tool.id()) {
         println!("      {:<8} not installed", tool.id());
         return 0;
     }

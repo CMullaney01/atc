@@ -1,6 +1,6 @@
 //! The only place that shells out to tmux. Everything else works on the values
 //! this hands back, so the rest of atc can be tested with no tmux server.
-use crate::proc;
+use crate::process::{base_command, command_lines, is_interpreter};
 use std::process::Command;
 
 const SEP: char = '\u{1f}';
@@ -75,11 +75,11 @@ pub(crate) fn list_panes() -> Vec<PaneInfo> {
 fn fill_command_lines(panes: &mut [PaneInfo]) {
     if !panes
         .iter()
-        .any(|p| proc::is_interpreter(proc::base_command(&p.command)))
+        .any(|p| is_interpreter(base_command(&p.command)))
     {
         return;
     }
-    let lines = proc::command_lines();
+    let lines = command_lines();
     for pane in panes.iter_mut() {
         if let Some(argv) = lines.get(&pane.tty) {
             pane.argv = argv.clone();

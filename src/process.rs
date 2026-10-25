@@ -8,7 +8,11 @@ use std::process::Command;
 
 /// Runtimes that agents are shipped on top of. A pane running one of these is
 /// not identified by its command name, so its command line has to be read.
-const INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3", "ruby"];
+///
+/// Only the JavaScript ones, because that is what the agents are written in:
+/// gemini and copilot are npm packages, and node is the one confirmed against
+/// a real pane. Nothing is listed here on the chance an agent might use it.
+const INTERPRETERS: &[&str] = &["node", "bun", "deno"];
 
 /// tmux reports a bare command name, but be tolerant of paths and the leading
 /// dash a login shell carries.
@@ -34,14 +38,14 @@ pub(crate) fn tool_from_argv(argv: &str) -> Option<Tool> {
         .find(|t| !t.starts_with('-'))?;
     Tool::ALL
         .into_iter()
-        .find(|t| path_names(script).any(|name| names_the_tool(name, t.id())))
+        .find(|t| path_names(script).any(|segment| names_the_tool(segment, t.id())))
 }
 
 /// Every path segment of a script, with the extension dropped so `gemini.js`
 /// and `gemini` read the same.
 fn path_names(script: &str) -> impl Iterator<Item = &str> {
     script.split('/').map(|seg| {
-        [".js", ".mjs", ".cjs", ".py"]
+        [".js", ".mjs", ".cjs"]
             .iter()
             .find_map(|ext| seg.strip_suffix(ext))
             .unwrap_or(seg)
@@ -51,10 +55,10 @@ fn path_names(script: &str) -> impl Iterator<Item = &str> {
 /// npm puts the agent's name in the package directory rather than the entry
 /// point, so `@github/copilot/index.js` is matched on `copilot`, and a
 /// trailing word is allowed for the ones that publish as `<name>-cli`.
-fn names_the_tool(name: &str, id: &str) -> bool {
-    name == id
-        || name
-            .strip_prefix(id)
+fn names_the_tool(segment: &str, tool_id: &str) -> bool {
+    segment == tool_id
+        || segment
+            .strip_prefix(tool_id)
             .is_some_and(|tail| tail.starts_with('-'))
 }
 
@@ -134,7 +138,7 @@ mod tests {
         for argv in [
             "node /Users/me/dev/site/build.js",
             "node",
-            "python3 -m http.server",
+            "bun /Users/me/dev/site/serve.ts",
             "",
         ] {
             assert_eq!(tool_from_argv(argv), None, "{argv}");

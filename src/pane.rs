@@ -1,7 +1,7 @@
 //! Works out what is running in a pane when no hook has reported it. Without
 //! this, a session that atc was never told about would be invisible.
 use crate::agent::Tool;
-use crate::proc::{base_command, is_interpreter, tool_from_argv};
+use crate::process::{base_command, is_interpreter, tool_from_argv};
 use crate::state::PaneState;
 use crate::tmux::PaneInfo;
 
