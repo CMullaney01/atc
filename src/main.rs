@@ -73,6 +73,23 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.get(i + 1).map(String::as_str)
 }
 
+/// The event name, wherever it sits among the flags. The hooks atc registers
+/// for the other agents put it after `--tool`, so reading the first argument
+/// found `--tool` and silently dropped every one of them.
+///
+/// Every flag atc takes carries a value, so a flag and its value are skipped
+/// together.
+fn event_arg(args: &[String]) -> Option<&str> {
+    let mut rest = args;
+    while let Some(first) = rest.first() {
+        if !first.starts_with("--") {
+            return Some(first);
+        }
+        rest = rest.get(2..).unwrap_or_default();
+    }
+    None
+}
+
 /// Hooks run on every tool call in every session, so this must never fail in a
 /// way Claude notices: all problems are logged and the exit code stays 0.
 /// Which agent called, and what its event is called here. `None` when the
@@ -123,7 +140,7 @@ fn parse_payload(event: &str, raw: &str) -> HookInput {
 }
 
 fn cmd_hook(args: &[String]) {
-    let Some(event) = args.first() else {
+    let Some(event) = event_arg(args) else {
         log("hook called without an event name");
         return;
     };
@@ -671,6 +688,50 @@ mod tests {
             .collect();
         assert_eq!(flag(&args, "--kind"), Some("idle_prompt"));
         assert_eq!(flag(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn every_registered_hook_command_parses_back_to_its_event() {
+        // The seam the other test missed: it checked the event name alone,
+        // while the command line atc registers puts it after --tool, where
+        // the argument reader never looked.
+        for tool in Tool::ALL {
+            for spec in tool.hooks() {
+                let cmd = spec.command(tool);
+                let args: Vec<String> = cmd
+                    .split_whitespace()
+                    .skip(2) // "atc hook"
+                    .map(str::to_string)
+                    .collect();
+                let event = event_arg(&args);
+                assert_eq!(
+                    event,
+                    Some(spec.event),
+                    "reading the event back out of: {cmd}"
+                );
+                assert!(
+                    resolve(&args, event.unwrap_or_default()).is_some(),
+                    "handler ignores its own registration: {cmd}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_event_is_found_whichever_side_of_the_flags_it_sits() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(event_arg(&args(&["Stop"])), Some("Stop"));
+        assert_eq!(
+            event_arg(&args(&["--tool", "gemini", "AfterAgent"])),
+            Some("AfterAgent")
+        );
+        assert_eq!(
+            event_arg(&args(&["Notification", "--kind", "idle_prompt"])),
+            Some("Notification")
+        );
+        // A flag whose value is missing must not be read as the event.
+        assert_eq!(event_arg(&args(&["--tool"])), None);
+        assert_eq!(event_arg(&args(&[])), None);
     }
 
     #[test]

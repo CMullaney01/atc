@@ -146,9 +146,11 @@ No daemon and no polling of pane contents.
 - Claude Code hooks run as subprocesses that inherit the session's environment,
   so `$TMUX_PANE` identifies which pane fired the event. That is the whole
   mechanism for knowing what every session is doing.
-- Claude panes report `pane_current_command` as a version string (`2.1.308`)
-  rather than `claude`, so unreported sessions are spotted by the `✳` prefix
-  Claude Code puts on the pane title.
+- An agent rarely reports its own name to tmux. Claude's binary is named
+  after its version (`2.1.308`), and gemini and copilot are npm packages, so
+  they run as `node`. A pane running an interpreter is identified by the
+  script it was handed — only the script, never the arguments after it, so
+  `node build.js --out gemini.txt` stays an ordinary job.
 - State lives in `~/.local/state/atc/panes/` as one small JSON file per pane,
   written atomically.
 - The hook also writes tmux user options — `@atc_state` on the pane and an
@@ -219,7 +221,9 @@ it at all.
 
 Two gotchas worth knowing, both of which make a hook silently never run:
 gemini only runs hooks in folders you have **trusted**, and codex ignores a
-project-local `.codex/config.toml` unless the project is trusted.
+project-local `.codex/config.toml` unless the project is trusted. `atc doctor`
+checks each installed agent's own config file and says which have no hooks
+registered, so a silent one is visible rather than guessed at.
 
 ## Anything else
 
