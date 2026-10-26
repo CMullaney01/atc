@@ -95,6 +95,17 @@ the keyboard back. Nothing about the agents' prompts is hardcoded, so this
 works the same for all four, and the preview tightens to 150ms while you're
 driving or sitting on a blocked session so a keypress never looks dead.
 
+The cursor opens on whatever most needs you, and `n` walks to the next session
+that does — blocked, waiting or errored, wrapping round, `N` to go back. So
+clearing three approvals is `n` `i` answer `ctrl-g`, three times, with no
+hunting. It's the same count the title reports, so `2 need you` means `n`
+visits two.
+
+Driving holds **the pane you chose**, not whatever the cursor is on. The list
+rebuilds every second and triage can reorder it while you're mid-approval, so
+the selection is anchored to its pane and nothing can redirect a keystroke to
+a session you didn't pick.
+
 Non-AI panes — editors, shells, running jobs — are listed too, because the
 popup is where you go to navigate. `tab` drops them when you only care about
 the fleet:
