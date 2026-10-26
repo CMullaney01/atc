@@ -192,6 +192,15 @@ fn transition(
             }
             Step::to(Status::Waiting)
         }
+        // Interrupting a turn stops it where it stood, so the session wants
+        // input again. Nothing closing is sent with this, and the message from
+        // the turn before it would read as though this one had finished.
+        "Interrupt" => {
+            st.tool = None;
+            st.subagents.clear();
+            st.last_message = None;
+            Step::to(Status::Waiting)
+        }
         "StopFailure" | "PostToolUseFailure" => Step::to(Status::Error),
         // Notification is an escalation signal only: permission_prompt lags the
         // real prompt by ~6s and idle_prompt by ~60s, so Stop and
@@ -227,6 +236,28 @@ mod tests {
         i.agent_id = Some(id.into());
         i.agent_type = Some(kind.into());
         i
+    }
+
+    #[test]
+    fn an_interrupted_turn_goes_back_to_waiting() {
+        let mut working = PaneState::new("%6");
+        working.status = Status::Working;
+        working.tool = Some("shell".into());
+        working.last_message = Some("the turn before this one".into());
+        working.subagents.push(state::Subagent {
+            id: "a1".into(),
+            agent_type: None,
+            since: state::now(),
+        });
+
+        let after = updated(apply("Interrupt", None, &input(), "%6", Some(working)));
+        assert_eq!(after.status, Status::Waiting);
+        assert_eq!(after.tool, None);
+        assert!(after.subagents.is_empty());
+        assert_eq!(
+            after.last_message, None,
+            "an interrupted turn said nothing, and the one before it would mislead"
+        );
     }
 
     #[test]

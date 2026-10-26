@@ -2,6 +2,7 @@
 //! inside a live coding session, so it must never fail in a way the user sees.
 mod agent;
 mod bar;
+mod doctor;
 mod hook;
 mod infer;
 mod pane;
@@ -47,7 +48,7 @@ fn main() {
         "ui" => ui::run(),
         "seen" => cmd_seen(rest),
         "sync" => cmd_sync(),
-        "doctor" => cmd_doctor(),
+        "doctor" => doctor::run(),
         "install" => {
             let only = flag(rest, "--tool").and_then(Tool::parse);
             if let Some(name) = flag(rest, "--tool") {
@@ -285,6 +286,7 @@ fn print_status_json(inv: &[bar::Entry]) {
                 "status": e.status().map(|s| s.label()),
                 "inferred": e.is_inferred(),
                 "source": e.state.map(|s| s.source.clone()),
+                "detected": e.tool().map(|t| t.id()),
                 "subagents": e.subagents().iter().map(|a| serde_json::json!({
                     "type": a.label(),
                     "age_secs": a.age_secs(),
@@ -410,105 +412,6 @@ fn cmd_seen(args: &[String]) {
     }
 }
 
-fn cmd_doctor() {
-    let problems = check_tmux() + check_state_dir() + check_hooks();
-
-    match tmux::current_pane() {
-        Some(p) => println!("ok    running inside tmux pane {p}"),
-        None => println!("WARN  not inside tmux, so panes cannot be identified"),
-    }
-    println!("ok    {} tracked pane(s)", state::all().len());
-    report_screen_confidence();
-
-    if problems > 0 {
-        std::process::exit(1);
-    }
-}
-
-/// Each check prints its own line and returns how many problems it found, so
-/// doctor reads as the list of checks it runs.
-fn check_tmux() -> u32 {
-    if tmux::available() {
-        println!("ok    tmux found");
-        return 0;
-    }
-    println!("FAIL  tmux not on PATH");
-    1
-}
-
-fn check_state_dir() -> u32 {
-    let dir = state::dir();
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => {
-            println!("ok    state dir {}", dir.display());
-            0
-        }
-        Err(e) => {
-            println!("FAIL  state dir {}: {e}", dir.display());
-            1
-        }
-    }
-}
-
-/// Only Claude's settings file is checked. The other three keep their hooks
-/// elsewhere and in their own formats, and a missing one is not a problem
-/// unless you use that agent.
-/// Every installed agent, and whether atc's hooks are actually registered
-/// with it. Checking only claude is how three quarters of a fleet came to be
-/// silently unreported.
-fn check_hooks() -> u32 {
-    Tool::ALL.into_iter().map(check_hooks_for).sum()
-}
-
-fn check_hooks_for(tool: Tool) -> u32 {
-    let shown = tool.config_path();
-    if !process::on_path(tool.id()) {
-        println!("      {:<8} not installed", tool.id());
-        return 0;
-    }
-    match expand_home(shown).map(std::fs::read_to_string) {
-        Some(Ok(body)) if body.contains("atc hook") => {
-            println!("ok    {:<8} hooks registered in {shown}", tool.id());
-            0
-        }
-        Some(Ok(_)) => {
-            println!(
-                "WARN  {:<8} no 'atc hook' in {shown} — run 'atc install --tool {}'",
-                tool.id(),
-                tool.id()
-            );
-            1
-        }
-        _ => {
-            println!(
-                "WARN  {:<8} no {shown} — run 'atc install --tool {}'",
-                tool.id(),
-                tool.id()
-            );
-            1
-        }
-    }
-}
-
-fn expand_home(path: &str) -> Option<std::path::PathBuf> {
-    let rest = path.strip_prefix("~/")?;
-    Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(rest))
-}
-
-/// Screen reading is a fallback for sessions that never fired a hook, and how
-/// much to trust it differs per agent. Say so rather than let a guess look
-/// like a report.
-fn report_screen_confidence() {
-    for tool in Tool::ALL {
-        let note = match tool.markers().confidence {
-            agent::Confidence::Seen => "screen rules checked against a live session",
-            agent::Confidence::FromSource => "screen rules taken from its source, never run",
-            agent::Confidence::None => "no screen rules — relies on its hooks alone",
-        };
-        println!("      {:<8} {note}", tool.id());
-    }
-}
-
 fn cmd_ask(args: &[String]) {
     if args.is_empty() {
         eprintln!("atc ask: need a question");
@@ -586,8 +489,8 @@ fn agent_install_text(tool: Tool) -> String {
             hooks_json(Tool::Claude)
         ),
         Tool::Codex => format!(
-            "# codex — add to {}. The feature flag is required:\n\
-             # without it the [hooks] table is ignored and codex panes stay unknown.\n\
+            "# codex — add to {}. Recent versions run hooks by default; the\n\
+             # flag below is harmless there and still needed by older ones.\n\
              # A project .codex/config.toml is only read for a trusted project.\n\n{}\n",
             Tool::Codex.config_path(),
             codex_hooks_toml()
@@ -606,15 +509,16 @@ fn agent_install_text(tool: Tool) -> String {
     }
 }
 
-/// Codex takes TOML; the other three take JSON. Both read the one hook table
-/// per tool, so a registration cannot drift from what the handler acts on.
+/// Codex takes an array of matcher groups per event, each holding its own
+/// array of handlers. Flattening that to one table per event registers a group
+/// with no handler in it, which codex accepts in silence and never runs.
 fn codex_hooks_toml() -> String {
-    let mut out = String::from("features.hooks = true\n\n[hooks]\n");
+    let mut out = String::from("[features]\nhooks = true\n");
     for spec in Tool::Codex.hooks() {
         out.push_str(&format!(
-            "{} = [{{ type = \"command\", command = \"{}\" }}]\n",
-            spec.event,
-            spec.command(Tool::Codex)
+            "\n[[hooks.{event}]]\n\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = \"{command}\"\n",
+            event = spec.event,
+            command = spec.command(Tool::Codex)
         ));
     }
     out
@@ -785,19 +689,38 @@ mod tests {
                 );
             }
         }
+    }
 
-        // Codex is TOML, so it is checked by shape: the feature flag it needs,
-        // and one line per event naming that event.
-        let toml = codex_hooks_toml();
-        assert!(
-            toml.starts_with("features.hooks = true"),
-            "the flag must lead, or the table below it is ignored"
+    /// Parsed rather than read as text: the shape this rejects is one codex
+    /// accepts in silence and never runs, which no check on the text can see.
+    #[test]
+    fn the_codex_install_block_is_well_formed() {
+        let generated = codex_hooks_toml();
+        let doc: toml::Value =
+            toml::from_str(&generated).expect("the codex config must be valid TOML");
+        assert_eq!(
+            doc.get("features").and_then(|f| f.get("hooks")),
+            Some(&toml::Value::Boolean(true)),
+            "the feature flag must survive, for the codex versions that need it"
         );
-        for line in toml.lines().skip(3).filter(|l| !l.is_empty()) {
-            let (event, rest) = line.split_once(" = ").expect("an assignment");
+        let hooks = doc.get("hooks").expect("a hooks table");
+        for spec in Tool::Codex.hooks() {
+            let want = spec.command(Tool::Codex);
+            let groups = hooks
+                .get(spec.event)
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("codex/{} registers no group", spec.event));
+            let mut handlers = groups
+                .iter()
+                .filter_map(|g| g.get("hooks").and_then(toml::Value::as_array))
+                .flatten();
             assert!(
-                rest.contains(&format!("atc hook --tool codex {event}")),
-                "codex/{event} is wired to the wrong command: {line}"
+                handlers.any(|h| {
+                    h.get("type").and_then(toml::Value::as_str) == Some("command")
+                        && h.get("command").and_then(toml::Value::as_str) == Some(want.as_str())
+                }),
+                "codex/{} has no command handler inside its group",
+                spec.event
             );
         }
     }

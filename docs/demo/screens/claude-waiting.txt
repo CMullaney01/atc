@@ -1,0 +1,22 @@
+  Bash   pyright src/hooks
+         0 errors, 0 warnings, 0 informations
+
+● Fixed the three type errors in hooks.py:
+
+  - line 41   the payload's session_id is Optional[str]; it was being passed
+              straight into a str parameter, so a hook with no session id
+              would have failed at runtime rather than at the boundary
+  - line 88   dict[str, Any] on the parsed body, not dict[str, str] — the
+              tool_input field is itself an object
+  - line 97   removed the unused Sequence import that came in with the
+              earlier refactor
+
+  The suite is green and pyright is clean.
+
+  One thing I did not touch: handle() still catches bare Exception at line
+  132. That hides a KeyError in the dispatch table, which is the failure you
+  would actually want to see. Narrowing it is a behaviour change, so I have
+  left it.
+
+  Want me to run pyright over the whole package before you commit, or narrow
+  that except first?
