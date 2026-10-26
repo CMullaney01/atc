@@ -117,12 +117,20 @@ impl Preview {
             self.lines.clear();
             return;
         };
-        if self.pane_id == pane_id && self.taken.elapsed() < PREVIEW_MAX_AGE {
+        if !self.is_due(pane_id) {
             return;
         }
         self.pane_id = pane_id.to_string();
         self.lines = tmux::capture_pane(pane_id);
         self.taken = Instant::now();
+    }
+
+    fn is_due(&self, pane_id: &str) -> bool {
+        self.pane_id != pane_id || self.taken.elapsed() >= PREVIEW_MAX_AGE
+    }
+
+    fn expire(&mut self) {
+        self.taken = Instant::now() - PREVIEW_MAX_AGE;
     }
 
     /// The bottom of a pane's screen is the part worth reading, so a short
@@ -330,6 +338,15 @@ impl Popup {
         }
     }
 
+    /// Pressing refresh has to beat every cache the popup keeps, or it does
+    /// nothing anyone can see: the list reloads itself on a timer anyway, and
+    /// the screen below it is reused until the capture it holds grows old.
+    fn force_reload(&mut self) {
+        self.cache.clear();
+        self.preview.expire();
+        self.reload();
+    }
+
     /// The drawn lines and, of those, the item indices the cursor can land on.
     fn visible(&self) -> (Vec<Row>, Vec<usize>) {
         let rows = build_rows(&self.items, &self.order, self.show_others);
@@ -429,10 +446,7 @@ impl Popup {
             KeyCode::Char('g') => self.cursor = 0,
             KeyCode::Char('G') => self.cursor = count.saturating_sub(1),
             KeyCode::Tab => self.show_others = !self.show_others,
-            KeyCode::Char('r') => {
-                self.cache.clear();
-                self.reload();
-            }
+            KeyCode::Char('r') => self.force_reload(),
             KeyCode::Char('p') => {
                 // Only an AI session can take a prompt.
                 if chosen.is_some_and(|i| self.items[i].kind.is_ai()) {
@@ -756,6 +770,32 @@ mod tests {
             TreeRow::Pane(0),
             TreeRow::Pane(1),
         ]
+    }
+
+    #[test]
+    fn a_refresh_recaptures_the_screen_already_on_show() {
+        let mut preview = Preview::blank();
+        preview.pane_id = "%1".to_string();
+        preview.taken = Instant::now();
+        assert!(
+            !preview.is_due("%1"),
+            "a screen taken a moment ago is reused rather than taken again"
+        );
+
+        preview.expire();
+
+        assert!(
+            preview.is_due("%1"),
+            "refresh must beat the reuse window, or pressing it changes nothing on the screen"
+        );
+    }
+
+    #[test]
+    fn a_different_pane_is_always_captured_at_once() {
+        let mut preview = Preview::blank();
+        preview.pane_id = "%1".to_string();
+        preview.taken = Instant::now();
+        assert!(preview.is_due("%2"));
     }
 
     #[test]
