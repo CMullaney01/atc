@@ -670,6 +670,19 @@ mod tests {
     }
 
     #[test]
+    fn copilots_camel_case_payload_is_read() {
+        let input = parse_payload(
+            "PreToolUse",
+            r#"{"sessionId":"s1","cwd":"/tmp","toolName":"bash","agentId":"a1","agentType":"Explore"}"#,
+        );
+        assert_eq!(input.session_id.as_deref(), Some("s1"));
+        assert_eq!(input.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(input.tool_name.as_deref(), Some("bash"));
+        assert_eq!(input.agent_id.as_deref(), Some("a1"));
+        assert_eq!(input.agent_type.as_deref(), Some("Explore"));
+    }
+
+    #[test]
     fn every_agents_install_block_is_well_formed() {
         for (tool, text) in [
             (Tool::Gemini, hooks_json(Tool::Gemini)),
