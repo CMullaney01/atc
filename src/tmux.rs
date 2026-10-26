@@ -2,8 +2,12 @@
 //! this hands back, so the rest of atc can be tested with no tmux server.
 use crate::process::{base_command, command_lines, is_interpreter};
 use std::process::Command;
+use std::time::Duration;
 
 const SEP: char = '\u{1f}';
+
+/// How long to leave between a prompt and the newline that sends it.
+const SUBMIT_GAP: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone)]
 pub(crate) struct PaneInfo {
@@ -155,8 +159,24 @@ pub(crate) fn refresh_client() {
     fire(&["refresh-client", "-S"]);
 }
 
-pub(crate) fn send_keys(pane: &str, text: &str) {
-    fire(&["send-keys", "-t", pane, text, "Enter"]);
+/// Types a prompt into a pane and sends it.
+///
+/// An agent's composer that gets the prompt and the newline in a single read
+/// has no way to tell that from pasted text, and keeps the newline as a line
+/// break instead of sending the message, so the newline goes on its own a
+/// moment later.
+///
+/// The prompt itself is sent literally. Without that a prompt tmux happens to
+/// know as a key name arrives as that key — "Space" becomes one space — and a
+/// prompt starting with a dash is read as a flag and never arrives at all.
+pub(crate) fn send_prompt(pane: &str, text: &str) {
+    fire(&prompt_args(pane, text));
+    std::thread::sleep(SUBMIT_GAP);
+    fire(&["send-keys", "-t", pane, "Enter"]);
+}
+
+fn prompt_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
+    ["send-keys", "-t", pane, "-l", "--", text]
 }
 
 pub(crate) fn kill_pane(pane: &str) {
@@ -210,6 +230,27 @@ pub(crate) fn escape_format(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prompt_is_sent_as_text_rather_than_as_keys() {
+        let args = prompt_args("%1", "Space");
+        assert!(
+            args.contains(&"-l"),
+            "a prompt tmux knows as a key name arrives as that key without this"
+        );
+        assert_eq!(args.last(), Some(&"Space"));
+    }
+
+    #[test]
+    fn a_prompt_starting_with_a_dash_is_not_read_as_a_flag() {
+        let args = prompt_args("%1", "-n never got sent");
+        let end_of_flags = args.iter().position(|a| *a == "--").expect("needs --");
+        let text = args.len() - 1;
+        assert!(
+            end_of_flags < text,
+            "tmux rejects the whole command as an unknown flag without this"
+        );
+    }
 
     #[test]
     fn capture_keeps_blank_lines_inside_but_not_at_the_end() {
