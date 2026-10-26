@@ -2,6 +2,7 @@
 //! inside a live coding session, so it must never fail in a way the user sees.
 mod agent;
 mod bar;
+mod doctor;
 mod hook;
 mod infer;
 mod pane;
@@ -47,7 +48,7 @@ fn main() {
         "ui" => ui::run(),
         "seen" => cmd_seen(rest),
         "sync" => cmd_sync(),
-        "doctor" => cmd_doctor(),
+        "doctor" => doctor::run(),
         "install" => {
             let only = flag(rest, "--tool").and_then(Tool::parse);
             if let Some(name) = flag(rest, "--tool") {
@@ -285,6 +286,7 @@ fn print_status_json(inv: &[bar::Entry]) {
                 "status": e.status().map(|s| s.label()),
                 "inferred": e.is_inferred(),
                 "source": e.state.map(|s| s.source.clone()),
+                "detected": e.tool().map(|t| t.id()),
                 "subagents": e.subagents().iter().map(|a| serde_json::json!({
                     "type": a.label(),
                     "age_secs": a.age_secs(),
@@ -407,105 +409,6 @@ fn cmd_seen(args: &[String]) {
     if state::save(&st).is_ok() {
         refresh_window_for(pane_id);
         tmux::refresh_client();
-    }
-}
-
-fn cmd_doctor() {
-    let problems = check_tmux() + check_state_dir() + check_hooks();
-
-    match tmux::current_pane() {
-        Some(p) => println!("ok    running inside tmux pane {p}"),
-        None => println!("WARN  not inside tmux, so panes cannot be identified"),
-    }
-    println!("ok    {} tracked pane(s)", state::all().len());
-    report_screen_confidence();
-
-    if problems > 0 {
-        std::process::exit(1);
-    }
-}
-
-/// Each check prints its own line and returns how many problems it found, so
-/// doctor reads as the list of checks it runs.
-fn check_tmux() -> u32 {
-    if tmux::available() {
-        println!("ok    tmux found");
-        return 0;
-    }
-    println!("FAIL  tmux not on PATH");
-    1
-}
-
-fn check_state_dir() -> u32 {
-    let dir = state::dir();
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => {
-            println!("ok    state dir {}", dir.display());
-            0
-        }
-        Err(e) => {
-            println!("FAIL  state dir {}: {e}", dir.display());
-            1
-        }
-    }
-}
-
-/// Only Claude's settings file is checked. The other three keep their hooks
-/// elsewhere and in their own formats, and a missing one is not a problem
-/// unless you use that agent.
-/// Every installed agent, and whether atc's hooks are actually registered
-/// with it. Checking only claude is how three quarters of a fleet came to be
-/// silently unreported.
-fn check_hooks() -> u32 {
-    Tool::ALL.into_iter().map(check_hooks_for).sum()
-}
-
-fn check_hooks_for(tool: Tool) -> u32 {
-    let shown = tool.config_path();
-    if !process::on_path(tool.id()) {
-        println!("      {:<8} not installed", tool.id());
-        return 0;
-    }
-    match expand_home(shown).map(std::fs::read_to_string) {
-        Some(Ok(body)) if body.contains("atc hook") => {
-            println!("ok    {:<8} hooks registered in {shown}", tool.id());
-            0
-        }
-        Some(Ok(_)) => {
-            println!(
-                "WARN  {:<8} no 'atc hook' in {shown} — run 'atc install --tool {}'",
-                tool.id(),
-                tool.id()
-            );
-            1
-        }
-        _ => {
-            println!(
-                "WARN  {:<8} no {shown} — run 'atc install --tool {}'",
-                tool.id(),
-                tool.id()
-            );
-            1
-        }
-    }
-}
-
-fn expand_home(path: &str) -> Option<std::path::PathBuf> {
-    let rest = path.strip_prefix("~/")?;
-    Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(rest))
-}
-
-/// Screen reading is a fallback for sessions that never fired a hook, and how
-/// much to trust it differs per agent. Say so rather than let a guess look
-/// like a report.
-fn report_screen_confidence() {
-    for tool in Tool::ALL {
-        let note = match tool.markers().confidence {
-            agent::Confidence::Seen => "screen rules checked against a live session",
-            agent::Confidence::FromSource => "screen rules taken from its source, never run",
-            agent::Confidence::None => "no screen rules — relies on its hooks alone",
-        };
-        println!("      {:<8} {note}", tool.id());
     }
 }
 

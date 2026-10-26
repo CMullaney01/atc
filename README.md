@@ -156,9 +156,13 @@ closed source and publishes no screen text, so atc doesn't guess at it at all.
 
 Two gotchas worth knowing, both of which make a hook silently never run: gemini
 only runs hooks in folders you have **trusted**, and codex ignores a
-project-local `.codex/config.toml` unless the project is trusted. `atc doctor`
-checks each installed agent's own config file and says which have no hooks
-registered, so a silent one is visible rather than guessed at.
+project-local `.codex/config.toml` unless the project is trusted.
+
+`atc doctor` is built for that failure. It **parses** each installed agent's own
+config rather than searching it for text, because a handler registered at the
+wrong depth is read without complaint and never runs — on paper it looks exactly
+like one that works. It also reports how many panes have actually reported
+through each agent, so "configured" and "working" stay separate claims.
 
 ## Sessions that never reported
 
