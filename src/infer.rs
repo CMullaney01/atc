@@ -14,9 +14,13 @@ const MAX_CAPTURES: usize = 12;
 /// A line offering a numbered choice, however the tool marks the selected one.
 /// On its own this means nothing — a picker looks exactly the same — so it only
 /// ever corroborates a question.
+fn after_prompt(line: &str) -> &str {
+    line.trim_start().trim_start_matches(['❯', '›', '>', ' '])
+}
+
 fn is_numbered_option(line: &str) -> bool {
-    let rest = line.trim_start().trim_start_matches(['❯', '›', '>', ' ']);
-    rest.split_once(". ")
+    after_prompt(line)
+        .split_once(". ")
         .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
@@ -42,10 +46,17 @@ pub(crate) fn from_screen(lines: &[String], tool: Tool) -> Option<Status> {
     }
     // An input box means it has stopped and wants a reply. The same arrow heads
     // a selected menu item, so a numbered option rules the line out.
+    // Some tools mark the box with an arrow and nothing else, so the arrow
+    // itself is the marker; others print a placeholder after one, and which
+    // arrow they draw is not worth depending on. Either way of matching counts.
     let waiting = !m.input.is_empty()
         && lines.iter().any(|l| {
             let t = l.trim_start();
-            m.input.iter().any(|p| t.starts_with(p)) && !is_numbered_option(t)
+            let is_box = m
+                .input
+                .iter()
+                .any(|p| t.starts_with(p) || after_prompt(t).starts_with(p));
+            is_box && !is_numbered_option(t)
         });
     if waiting {
         return Some(Status::Waiting);
@@ -76,6 +87,25 @@ mod tests {
 
     fn screen(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn an_empty_codex_composer_means_it_is_waiting() {
+        let s = screen("› Ask Codex to do anything");
+        assert_eq!(from_screen(&s, Tool::Codex), Some(Status::Waiting));
+    }
+
+    #[test]
+    fn a_working_codex_is_not_read_as_waiting() {
+        let s = screen(
+            "• Working (12s • esc to interrupt)\n\
+             › Ask Codex to do anything",
+        );
+        assert_eq!(
+            from_screen(&s, Tool::Codex),
+            Some(Status::Working),
+            "the composer stays on screen while it works, so working must win"
+        );
     }
 
     #[test]

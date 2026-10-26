@@ -21,7 +21,7 @@ to cycle through every pane and look.
 `atc` puts that on your status bar, and the whole fleet behind `prefix + a`.
 
 It works with **claude, codex, gemini and copilot**, driven by each one's own
-hooks. No daemon, no polling, no wrapper around your agents.
+hooks. No daemon, and no wrapper around your agents.
 
 ## The row
 
@@ -144,7 +144,7 @@ prints the right block for one of them.
 | Agent | Hook config | Read off its screen |
 |---|---|---|
 | `claude` | `~/.claude/settings.json` → `hooks` | working, blocked, waiting |
-| `codex` | `~/.codex/config.toml` → `features.hooks = true` + `[hooks]` | working, blocked |
+| `codex` | `~/.codex/config.toml` → `[hooks]` | working, blocked, waiting |
 | `gemini` | `~/.gemini/settings.json` → `hooks` | blocked |
 | `copilot` | `~/.copilot/hooks/atc.json` | nothing |
 
@@ -174,7 +174,8 @@ ever written to disk.
 
 ## How it works
 
-No daemon and no polling of pane contents.
+No daemon, and nothing watches a session that has reported — it speaks when
+something happens to it.
 
 - Hooks run as subprocesses that inherit the session's environment, so
   `$TMUX_PANE` identifies which pane fired the event. That's the whole
@@ -193,6 +194,10 @@ No daemon and no polling of pane contents.
   session stops rather than on the next status interval.
 - The row reconciles against `tmux list-panes` on every render, so a killed
   pane can't leave a ghost glyph behind.
+- The one thing read rather than reported is an **unreported** pane's screen.
+  The row redraws every two seconds, so each such pane is captured that often,
+  up to twelve per render. A fleet where everything has reported captures
+  nothing at all.
 
 ## Install
 

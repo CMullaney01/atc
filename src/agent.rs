@@ -100,6 +100,7 @@ const CODEX_HOOKS: &[HookSpec] = &[
     HookSpec::plain("SubagentStart"),
     HookSpec::plain("SubagentStop"),
     HookSpec::plain("SessionEnd"),
+    HookSpec::plain("Interrupt"),
 ];
 
 /// Gemini has no matchers, so which alert its Notification was comes from the
@@ -199,6 +200,7 @@ impl Tool {
             "Notification",
             "SubagentStart",
             "SubagentStop",
+            "Interrupt",
         ];
         if let Some(hit) = CANONICAL.iter().find(|c| **c == event) {
             return Some(hit);
@@ -245,11 +247,13 @@ impl Tool {
                 confidence: Confidence::Seen,
             },
             // Its status line reads "• Working (0s • esc to interrupt)", and
-            // "Yes, proceed" is the first option of its approval overlay.
+            // "Yes, proceed" is the first option of its approval overlay. The
+            // placeholder is only on screen while the composer is empty, which
+            // means the turn has finished and it is ready for a reply.
             Tool::Codex => Markers {
                 working: &["esc to interrupt"],
                 questions: &["Yes, proceed"],
-                input: &[],
+                input: &["Ask Codex to do anything"],
                 confidence: Confidence::FromSource,
             },
             // The three questions its tool-confirmation component can ask.

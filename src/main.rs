@@ -586,8 +586,8 @@ fn agent_install_text(tool: Tool) -> String {
             hooks_json(Tool::Claude)
         ),
         Tool::Codex => format!(
-            "# codex — add to {}. The feature flag is required:\n\
-             # without it the [hooks] table is ignored and codex panes stay unknown.\n\
+            "# codex — add to {}. Recent versions run hooks by default; the\n\
+             # flag below is harmless there and still needed by older ones.\n\
              # A project .codex/config.toml is only read for a trusted project.\n\n{}\n",
             Tool::Codex.config_path(),
             codex_hooks_toml()
@@ -606,15 +606,16 @@ fn agent_install_text(tool: Tool) -> String {
     }
 }
 
-/// Codex takes TOML; the other three take JSON. Both read the one hook table
-/// per tool, so a registration cannot drift from what the handler acts on.
+/// Codex takes an array of matcher groups per event, each holding its own
+/// array of handlers. Flattening that to one table per event registers a group
+/// with no handler in it, which codex accepts in silence and never runs.
 fn codex_hooks_toml() -> String {
-    let mut out = String::from("features.hooks = true\n\n[hooks]\n");
+    let mut out = String::from("[features]\nhooks = true\n");
     for spec in Tool::Codex.hooks() {
         out.push_str(&format!(
-            "{} = [{{ type = \"command\", command = \"{}\" }}]\n",
-            spec.event,
-            spec.command(Tool::Codex)
+            "\n[[hooks.{event}]]\n\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = \"{command}\"\n",
+            event = spec.event,
+            command = spec.command(Tool::Codex)
         ));
     }
     out
@@ -786,18 +787,35 @@ mod tests {
             }
         }
 
-        // Codex is TOML, so it is checked by shape: the feature flag it needs,
-        // and one line per event naming that event.
-        let toml = codex_hooks_toml();
-        assert!(
-            toml.starts_with("features.hooks = true"),
-            "the flag must lead, or the table below it is ignored"
+        // Codex is TOML, and this parses it rather than reading the text,
+        // because the shape it rejected was one it accepts in silence and
+        // never runs. Any check on the generated text walks straight past that.
+        let generated = codex_hooks_toml();
+        let doc: toml::Value =
+            toml::from_str(&generated).expect("the codex config must be valid TOML");
+        assert_eq!(
+            doc.get("features").and_then(|f| f.get("hooks")),
+            Some(&toml::Value::Boolean(true)),
+            "the feature flag must survive, for the codex versions that need it"
         );
-        for line in toml.lines().skip(3).filter(|l| !l.is_empty()) {
-            let (event, rest) = line.split_once(" = ").expect("an assignment");
+        let hooks = doc.get("hooks").expect("a hooks table");
+        for spec in Tool::Codex.hooks() {
+            let want = spec.command(Tool::Codex);
+            let groups = hooks
+                .get(spec.event)
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("codex/{} registers no group", spec.event));
+            let mut handlers = groups
+                .iter()
+                .filter_map(|g| g.get("hooks").and_then(toml::Value::as_array))
+                .flatten();
             assert!(
-                rest.contains(&format!("atc hook --tool codex {event}")),
-                "codex/{event} is wired to the wrong command: {line}"
+                handlers.any(|h| {
+                    h.get("type").and_then(toml::Value::as_str) == Some("command")
+                        && h.get("command").and_then(toml::Value::as_str) == Some(want.as_str())
+                }),
+                "codex/{} has no command handler inside its group",
+                spec.event
             );
         }
     }
