@@ -11,8 +11,7 @@ use std::collections::BTreeSet;
 
 pub(crate) fn run() {
     let tracked = state::all();
-    let problems =
-        check_tmux() + check_state_dir() + check_state_files(&tracked) + check_agents(&tracked);
+    let problems = check_tmux() + check_state_dir() + check_state_files() + check_agents(&tracked);
 
     match tmux::current_pane() {
         Some(p) => println!("ok    running inside tmux pane {p}"),
@@ -51,20 +50,25 @@ fn check_state_dir() -> u32 {
 
 /// A state file atc cannot read is skipped in silence everywhere else, which
 /// makes a session look as though it never reported at all.
-fn check_state_files(tracked: &[PaneState]) -> u32 {
+fn check_state_files() -> u32 {
     let Ok(entries) = std::fs::read_dir(state::dir()) else {
         return 0;
     };
-    let files = entries
+    let unreadable = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter(|p| !holds_a_pane_state(p))
         .count();
-    let unreadable = files.saturating_sub(tracked.len());
     if unreadable == 0 {
         return 0;
     }
     println!("WARN  {unreadable} state file(s) could not be read, so those panes look unreported");
     1
+}
+
+fn holds_a_pane_state(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|raw| serde_json::from_str::<PaneState>(&raw).is_ok())
 }
 
 fn check_agents(tracked: &[PaneState]) -> u32 {

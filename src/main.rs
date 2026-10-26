@@ -689,10 +689,12 @@ mod tests {
                 );
             }
         }
+    }
 
-        // Codex is TOML, and this parses it rather than reading the text,
-        // because the shape it rejected was one it accepts in silence and
-        // never runs. Any check on the generated text walks straight past that.
+    /// Parsed rather than read as text: the shape this rejects is one codex
+    /// accepts in silence and never runs, which no check on the text can see.
+    #[test]
+    fn the_codex_install_block_is_well_formed() {
         let generated = codex_hooks_toml();
         let doc: toml::Value =
             toml::from_str(&generated).expect("the codex config must be valid TOML");
