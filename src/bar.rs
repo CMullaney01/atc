@@ -150,6 +150,13 @@ type WindowGroup = (u32, String, Vec<usize>);
 /// One session and its windows.
 type SessionGroup = (String, Vec<WindowGroup>);
 
+/// Whether one of atc's tmux options has been turned off. Only an explicit
+/// refusal counts, so an option nobody has set behaves the way it always has,
+/// and every option answers to the same words.
+fn switched_off(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("off" | "0" | "no" | "false"))
+}
+
 /// Whether the fleet is listed with whatever wants you first, or in the order
 /// tmux itself holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,12 +170,11 @@ impl Order {
         Self::read(tmux::global_option("@atc_triage").as_deref())
     }
 
-    /// Only an explicit refusal turns triage off, so an unset option behaves
-    /// the way it always has.
     fn read(value: Option<&str>) -> Self {
-        match value.map(str::trim) {
-            Some("off" | "0" | "no" | "false") => Order::AsTmux,
-            _ => Order::Triage,
+        if switched_off(value) {
+            Order::AsTmux
+        } else {
+            Order::Triage
         }
     }
 }
@@ -278,12 +284,11 @@ impl Paint {
         Self::read(tmux::global_option("@atc_colour").as_deref())
     }
 
-    /// Only an explicit refusal turns colour off, so an unset option behaves
-    /// the way it always has.
     fn read(value: Option<&str>) -> Self {
-        match value.map(str::trim) {
-            Some("off" | "0" | "no" | "false") => Paint::Mono,
-            _ => Paint::Colour,
+        if switched_off(value) {
+            Paint::Mono
+        } else {
+            Paint::Colour
         }
     }
 
@@ -520,15 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn triage_is_on_until_it_is_explicitly_refused() {
-        assert_eq!(Order::read(None), Order::Triage);
-        assert_eq!(Order::read(Some("on")), Order::Triage);
-        assert_eq!(Order::read(Some("off")), Order::AsTmux);
-        assert_eq!(Order::read(Some(" off ")), Order::AsTmux);
-        assert_eq!(Order::read(Some("false")), Order::AsTmux);
-    }
-
-    #[test]
     fn the_attached_session_comes_first_however_quiet_it_is() {
         let panes = vec![
             pane("%1", "other", 0, "zsh", 0, "2.1.308"),
@@ -741,13 +737,17 @@ mod tests {
         );
     }
 
+    /// Both options are read the same way on purpose: an option that honoured
+    /// "0" while its neighbour only honoured "off" would be a trap.
     #[test]
-    fn only_an_explicit_refusal_turns_colour_off() {
+    fn only_an_explicit_refusal_turns_an_option_off() {
         for off in ["off", "0", "no", "false", " off "] {
             assert_eq!(Paint::read(Some(off)), Paint::Mono, "{off:?}");
+            assert_eq!(Order::read(Some(off)), Order::AsTmux, "{off:?}");
         }
         for on in [None, Some(""), Some("on"), Some("yes"), Some("anything")] {
             assert_eq!(Paint::read(on), Paint::Colour, "{on:?}");
+            assert_eq!(Order::read(on), Order::Triage, "{on:?}");
         }
     }
 
