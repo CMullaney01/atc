@@ -309,7 +309,11 @@ fn print_status_tree(inv: &[bar::Entry]) {
     if inv.iter().all(|e| !e.kind.is_ai()) {
         println!("no AI sessions");
     }
-    for row in bar::tree(inv, tmux::current_session().as_deref()) {
+    for row in bar::tree(
+        inv,
+        tmux::current_session().as_deref(),
+        bar::Order::from_tmux(),
+    ) {
         match row {
             bar::TreeRow::Session(name) => println!("{name}"),
             bar::TreeRow::Window { index, name } => println!("  {index} {name}"),

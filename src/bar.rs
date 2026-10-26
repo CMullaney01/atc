@@ -138,6 +138,7 @@ const SEPARATOR: &str = "colour240";
 /// One line of the workspace as it is actually laid out. Flat rather than
 /// nested so that a caller can walk it straight into rows, and shared so the
 /// popup and `atc status` cannot drift apart.
+#[derive(Debug)]
 pub(crate) enum TreeRow {
     Session(String),
     Window { index: u32, name: String },
@@ -149,23 +150,54 @@ type WindowGroup = (u32, String, Vec<usize>);
 /// One session and its windows.
 type SessionGroup = (String, Vec<WindowGroup>);
 
+/// Whether one of atc's tmux options has been turned off. Only an explicit
+/// refusal counts, so an option nobody has set behaves the way it always has,
+/// and every option answers to the same words.
+fn switched_off(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("off" | "0" | "no" | "false"))
+}
+
+/// Whether the fleet is listed with whatever wants you first, or in the order
+/// tmux itself holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Order {
+    Triage,
+    AsTmux,
+}
+
+impl Order {
+    pub(crate) fn from_tmux() -> Self {
+        Self::read(tmux::global_option("@atc_triage").as_deref())
+    }
+
+    fn read(value: Option<&str>) -> Self {
+        if switched_off(value) {
+            Order::AsTmux
+        } else {
+            Order::Triage
+        }
+    }
+}
+
 /// Groups panes under the window and session they live in.
 ///
-/// Sessions lead with the one you are attached to and windows lead with
-/// whatever is most urgent, so the thing that needs you still surfaces — but
-/// panes keep their on-screen order inside a window, so a session always
-/// appears next to whatever it shares a window with.
-pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>) -> Vec<TreeRow> {
+/// Under triage, sessions lead with the one you are attached to and windows
+/// lead with whatever is most urgent, so the thing that needs you surfaces.
+/// Turned off, everything keeps tmux's own order and nothing moves on its own.
+/// Panes keep their on-screen order inside a window either way, so a session
+/// always appears next to whatever it shares a window with.
+pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>, order: Order) -> Vec<TreeRow> {
     let mut sessions = group_by_window(entries);
-    order_sessions(&mut sessions, entries, current_session);
+    order_sessions(&mut sessions, entries, current_session, order);
 
     let mut out = Vec::new();
     for (session, mut windows) in sessions {
         out.push(TreeRow::Session(session));
-        windows.sort_by(|a, b| {
-            worst_of(entries, &b.2)
+        windows.sort_by(|a, b| match order {
+            Order::Triage => worst_of(entries, &b.2)
                 .cmp(&worst_of(entries, &a.2))
-                .then(a.0.cmp(&b.0))
+                .then(a.0.cmp(&b.0)),
+            Order::AsTmux => a.0.cmp(&b.0),
         });
         for (index, name, members) in windows {
             out.push(TreeRow::Window { index, name });
@@ -209,7 +241,16 @@ fn group_by_window(entries: &[Entry]) -> Vec<SessionGroup> {
 
 /// The session you are attached to leads, then whichever holds the most urgent
 /// pane, then by name so the order never wobbles between redraws.
-fn order_sessions(sessions: &mut [SessionGroup], entries: &[Entry], current: Option<&str>) {
+fn order_sessions(
+    sessions: &mut [SessionGroup],
+    entries: &[Entry],
+    current: Option<&str>,
+    order: Order,
+) {
+    if order == Order::AsTmux {
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        return;
+    }
     sessions.sort_by(|a, b| {
         let mine = |name: &str| u8::from(current.is_some_and(|c| c == name));
         let worst_in = |windows: &Vec<WindowGroup>| {
@@ -243,12 +284,11 @@ impl Paint {
         Self::read(tmux::global_option("@atc_colour").as_deref())
     }
 
-    /// Only an explicit refusal turns colour off, so an unset option behaves
-    /// the way it always has.
     fn read(value: Option<&str>) -> Self {
-        match value.map(str::trim) {
-            Some("off" | "0" | "no" | "false") => Paint::Mono,
-            _ => Paint::Colour,
+        if switched_off(value) {
+            Paint::Mono
+        } else {
+            Paint::Colour
         }
     }
 
@@ -438,7 +478,7 @@ mod tests {
         ];
         let states = vec![st("%3", Status::Working), st("%2", Status::Blocked)];
         let inv = inventory(&states, &panes);
-        let rows = tree(&inv, Some("ws"));
+        let rows = tree(&inv, Some("ws"), Order::Triage);
 
         let shape: Vec<String> = rows
             .iter()
@@ -465,6 +505,26 @@ mod tests {
     }
 
     #[test]
+    fn triage_off_leaves_the_urgent_window_where_tmux_put_it() {
+        let panes = vec![
+            pane("%1", "ws", 0, "editor", 0, "2.1.308"),
+            pane("%2", "ws", 1, "atc", 0, "2.1.308"),
+        ];
+        let states = vec![st("%2", Status::Blocked)];
+        let inv = inventory(&states, &panes);
+
+        let triaged = tree(&inv, Some("ws"), Order::Triage);
+        let as_tmux = tree(&inv, Some("ws"), Order::AsTmux);
+
+        let leads = |rows: &[TreeRow]| match &rows[1] {
+            TreeRow::Window { index, .. } => *index,
+            other => panic!("a session is followed by a window, got {other:?}"),
+        };
+        assert_eq!(leads(&triaged), 1, "the blocked window rises under triage");
+        assert_eq!(leads(&as_tmux), 0, "nothing moves with triage off");
+    }
+
+    #[test]
     fn the_attached_session_comes_first_however_quiet_it_is() {
         let panes = vec![
             pane("%1", "other", 0, "zsh", 0, "2.1.308"),
@@ -472,7 +532,7 @@ mod tests {
         ];
         let states = vec![st("%1", Status::Blocked), st("%2", Status::Idle)];
         let inv = inventory(&states, &panes);
-        let rows = tree(&inv, Some("mine"));
+        let rows = tree(&inv, Some("mine"), Order::Triage);
         match &rows[0] {
             TreeRow::Session(n) => assert_eq!(n, "mine"),
             _ => panic!("a session heading should lead"),
@@ -677,13 +737,17 @@ mod tests {
         );
     }
 
+    /// Both options are read the same way on purpose: an option that honoured
+    /// "0" while its neighbour only honoured "off" would be a trap.
     #[test]
-    fn only_an_explicit_refusal_turns_colour_off() {
+    fn only_an_explicit_refusal_turns_an_option_off() {
         for off in ["off", "0", "no", "false", " off "] {
             assert_eq!(Paint::read(Some(off)), Paint::Mono, "{off:?}");
+            assert_eq!(Order::read(Some(off)), Order::AsTmux, "{off:?}");
         }
         for on in [None, Some(""), Some("on"), Some("yes"), Some("anything")] {
             assert_eq!(Paint::read(on), Paint::Colour, "{on:?}");
+            assert_eq!(Order::read(on), Order::Triage, "{on:?}");
         }
     }
 

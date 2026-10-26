@@ -66,6 +66,15 @@ and you can see which terminal belongs to what. Windows lead with whatever is
 most urgent, and the session you're attached to comes first, so the thing that
 wants you still rises to the top.
 
+That reordering is **triage**, and it's on by default. The cost is that the
+list moves as the fleet does, so a row can shift under your cursor the moment
+something goes blocked. Turn it off and the list keeps tmux's own order, where
+nothing ever moves on its own:
+
+```sh
+set -g @atc_triage off
+```
+
 | Column | |
 |---|---|
 | glyph | its state, same as the row |
@@ -78,6 +87,13 @@ The bottom half is the **live screen of the selected pane**, so you can read
 what a session actually said and answer it with `p` without going there.
 Everything is jumpable, so the popup is also how you get back to the `nvim` or
 `k9s` pane.
+
+`i` goes further and **drives** the selected pane: every key you press from
+then on goes to it, so an approval gets answered — arrows, a digit, `y`,
+`enter`, `esc` to interrupt — while you watch the screen below. `ctrl-g` hands
+the keyboard back. Nothing about the agents' prompts is hardcoded, so this
+works the same for all four, and the preview tightens to 150ms while you're
+driving or sitting on a blocked session so a keypress never looks dead.
 
 Non-AI panes — editors, shells, running jobs — are listed too, because the
 popup is where you go to navigate. `tab` drops them when you only care about
