@@ -410,7 +410,7 @@ impl Popup {
             KeyCode::Enter => {
                 if let Some(i) = chosen {
                     if !buf.is_empty() {
-                        tmux::send_keys(&self.items[i].pane_id, &buf);
+                        tmux::send_prompt(&self.items[i].pane_id, &buf);
                     }
                 }
             }
