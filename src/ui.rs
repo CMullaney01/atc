@@ -99,7 +99,9 @@ enum Row {
 struct Preview {
     pane_id: String,
     lines: Vec<String>,
-    taken: Instant,
+    /// None until a screen has been taken, and again once a refresh has thrown
+    /// the last one away.
+    taken: Option<Instant>,
 }
 
 impl Preview {
@@ -107,7 +109,7 @@ impl Preview {
         Preview {
             pane_id: String::new(),
             lines: Vec::new(),
-            taken: Instant::now() - PREVIEW_MAX_AGE,
+            taken: None,
         }
     }
 
@@ -122,15 +124,18 @@ impl Preview {
         }
         self.pane_id = pane_id.to_string();
         self.lines = tmux::capture_pane(pane_id);
-        self.taken = Instant::now();
+        self.taken = Some(Instant::now());
     }
 
     fn is_due(&self, pane_id: &str) -> bool {
-        self.pane_id != pane_id || self.taken.elapsed() >= PREVIEW_MAX_AGE
+        self.pane_id != pane_id
+            || self
+                .taken
+                .is_none_or(|taken| taken.elapsed() >= PREVIEW_MAX_AGE)
     }
 
     fn expire(&mut self) {
-        self.taken = Instant::now() - PREVIEW_MAX_AGE;
+        self.taken = None;
     }
 
     /// The bottom of a pane's screen is the part worth reading, so a short
@@ -776,7 +781,7 @@ mod tests {
     fn a_refresh_recaptures_the_screen_already_on_show() {
         let mut preview = Preview::blank();
         preview.pane_id = "%1".to_string();
-        preview.taken = Instant::now();
+        preview.taken = Some(Instant::now());
         assert!(
             !preview.is_due("%1"),
             "a screen taken a moment ago is reused rather than taken again"
@@ -794,8 +799,13 @@ mod tests {
     fn a_different_pane_is_always_captured_at_once() {
         let mut preview = Preview::blank();
         preview.pane_id = "%1".to_string();
-        preview.taken = Instant::now();
+        preview.taken = Some(Instant::now());
         assert!(preview.is_due("%2"));
+    }
+
+    #[test]
+    fn a_preview_that_has_never_captured_is_due() {
+        assert!(Preview::blank().is_due("%1"));
     }
 
     #[test]
