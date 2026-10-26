@@ -1,26 +1,32 @@
-//! Decides what one Claude Code hook event means for the pane it came from.
+//! Decides what one hook event means for the pane it came from, once the
+//! agent's own name for it has been mapped onto the set used here.
 //! Reads and writes nothing, so the event rules can be tested on their own.
 use crate::state::{self, PaneState, Status};
 use serde::Deserialize;
 
+/// Copilot names these fields in camelCase when its hooks are registered
+/// under its camelCase event names, which is how atc registers them. The other
+/// agents send snake_case, so both spellings are accepted rather than one of
+/// them picked.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct HookInput {
-    #[serde(default)]
+    #[serde(default, alias = "sessionId")]
     pub(crate) session_id: Option<String>,
     #[serde(default)]
     pub(crate) cwd: Option<String>,
     #[serde(default)]
     pub(crate) session_title: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "toolName")]
     pub(crate) tool_name: Option<String>,
     #[serde(default)]
     pub(crate) last_assistant_message: Option<String>,
-    /// Present only when the hook fired inside a subagent.
-    #[serde(default)]
+    /// Present only when the hook fired inside a subagent. Missing it means a
+    /// subagent's events cannot be told from the session's own.
+    #[serde(default, alias = "agentId")]
     pub(crate) agent_id: Option<String>,
     /// The subagent's display name, such as `Explore`. Can be empty for the
-    /// agents Claude Code runs internally.
-    #[serde(default)]
+    /// agents an assistant runs internally.
+    #[serde(default, alias = "agentType")]
     pub(crate) agent_type: Option<String>,
     /// Which alert this is, for the agents that have no matchers to pass one.
     #[serde(default)]
@@ -236,6 +242,20 @@ mod tests {
         i.agent_id = Some(id.into());
         i.agent_type = Some(kind.into());
         i
+    }
+
+    #[test]
+    fn a_subagent_finishing_does_not_free_a_pane_that_names_it_in_camel_case() {
+        let mut working = PaneState::new("%6");
+        working.status = Status::Working;
+        let raw = r#"{"sessionId":"s1","agentId":"a1","agentType":"Explore"}"#;
+        let from_subagent: HookInput = serde_json::from_str(raw).expect("copilot payload");
+
+        assert_eq!(
+            apply("Stop", None, &from_subagent, "%6", Some(working)),
+            Outcome::Ignore,
+            "a subagent finishing says nothing about whether the session wants you"
+        );
     }
 
     #[test]
