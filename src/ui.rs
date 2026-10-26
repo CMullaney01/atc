@@ -24,6 +24,15 @@ use std::time::{Duration, Instant};
 /// How long a captured screen is reused before it is taken again.
 const PREVIEW_MAX_AGE: Duration = Duration::from_millis(700);
 
+/// The same, for a pane being driven or one sitting on an approval, where the
+/// screen is the only feedback there is and a stale one reads as a dead key.
+const LIVE_PREVIEW_MAX_AGE: Duration = Duration::from_millis(150);
+
+/// How long to wait for a key before drawing again. It has to be shorter than
+/// the liveliest capture, or a screen would never be taken as often as it is
+/// allowed to be.
+const KEY_WAIT: Duration = Duration::from_millis(100);
+
 struct Item {
     pane_id: String,
     session: String,
@@ -83,6 +92,59 @@ enum Mode {
     Browse,
     Prompt(String),
     ConfirmKill,
+    /// Keys go to the selected pane rather than to the popup, which is how an
+    /// approval gets answered without leaving the fleet.
+    Drive,
+}
+
+/// One keystroke on its way to a pane. tmux asks for a key by name, but a
+/// plain character has to go as text or a prompt of "Space" would arrive as
+/// the space key.
+enum Keystroke {
+    Text(char),
+    Named(&'static str),
+}
+
+/// The key that stops a pane being driven and gives the popup its keyboard
+/// back.
+///
+/// It has to be one a terminal reports as itself. Ctrl and a bracket arrive as
+/// the byte 0x1d, which is read as ctrl and a digit, so a popup watching for
+/// the bracket would never see it and the only way out would be to close the
+/// popup. Ctrl-g is in the range terminals spell plainly, and no agent wants
+/// it.
+fn is_hand_back(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// What a key pressed while driving a pane becomes. Anything with no tmux
+/// spelling is dropped rather than guessed at.
+fn keystroke(key: KeyEvent) -> Option<Keystroke> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Some(Keystroke::Named("C-c")),
+            KeyCode::Char('d') => Some(Keystroke::Named("C-d")),
+            KeyCode::Char('u') => Some(Keystroke::Named("C-u")),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(Keystroke::Text(c)),
+        KeyCode::Enter => Some(Keystroke::Named("Enter")),
+        KeyCode::Esc => Some(Keystroke::Named("Escape")),
+        KeyCode::Tab => Some(Keystroke::Named("Tab")),
+        KeyCode::BackTab => Some(Keystroke::Named("BTab")),
+        KeyCode::Backspace => Some(Keystroke::Named("BSpace")),
+        KeyCode::Up => Some(Keystroke::Named("Up")),
+        KeyCode::Down => Some(Keystroke::Named("Down")),
+        KeyCode::Left => Some(Keystroke::Named("Left")),
+        KeyCode::Right => Some(Keystroke::Named("Right")),
+        KeyCode::PageUp => Some(Keystroke::Named("PageUp")),
+        KeyCode::PageDown => Some(Keystroke::Named("PageDown")),
+        KeyCode::Home => Some(Keystroke::Named("Home")),
+        KeyCode::End => Some(Keystroke::Named("End")),
+        _ => None,
+    }
 }
 
 /// One drawn line. Only `Pane` can be selected — the rest are structure, and a
@@ -113,13 +175,13 @@ impl Preview {
         }
     }
 
-    fn follow(&mut self, pane_id: Option<&str>) {
+    fn follow(&mut self, pane_id: Option<&str>, max_age: Duration) {
         let Some(pane_id) = pane_id else {
             self.pane_id.clear();
             self.lines.clear();
             return;
         };
-        if !self.is_due(pane_id) {
+        if !self.is_due(pane_id, max_age) {
             return;
         }
         self.pane_id = pane_id.to_string();
@@ -127,11 +189,8 @@ impl Preview {
         self.taken = Some(Instant::now());
     }
 
-    fn is_due(&self, pane_id: &str) -> bool {
-        self.pane_id != pane_id
-            || self
-                .taken
-                .is_none_or(|taken| taken.elapsed() >= PREVIEW_MAX_AGE)
+    fn is_due(&self, pane_id: &str, max_age: Duration) -> bool {
+        self.pane_id != pane_id || self.taken.is_none_or(|taken| taken.elapsed() >= max_age)
     }
 
     fn expire(&mut self) {
@@ -257,7 +316,11 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, Vec<Tree
     let panes = tmux::list_panes();
     let mut inv = bar::inventory(&states, &panes);
     infer::decorate(&mut inv);
-    let order = bar::tree(&inv, tmux::current_session().as_deref());
+    let order = bar::tree(
+        &inv,
+        tmux::current_session().as_deref(),
+        bar::Order::from_tmux(),
+    );
     let ai_count = inv.iter().filter(|e| e.kind.is_ai()).count();
     let items = inv
         .iter()
@@ -352,6 +415,18 @@ impl Popup {
         self.reload();
     }
 
+    /// Capturing a screen shells out to tmux, so the fleet is watched at a
+    /// gentle rate and only the pane being acted on is watched closely.
+    fn preview_max_age(&self, chosen: Option<usize>) -> Duration {
+        let driving = matches!(self.mode, Mode::Drive);
+        let waiting_on_me = chosen.is_some_and(|i| self.items[i].status == Some(Status::Blocked));
+        if driving || waiting_on_me {
+            LIVE_PREVIEW_MAX_AGE
+        } else {
+            PREVIEW_MAX_AGE
+        }
+    }
+
     /// The drawn lines and, of those, the item indices the cursor can land on.
     fn visible(&self) -> (Vec<Row>, Vec<usize>) {
         let rows = build_rows(&self.items, &self.order, self.show_others);
@@ -365,7 +440,8 @@ impl Popup {
         let chosen = pick.get(self.cursor).copied();
 
         let following = chosen.map(|i| self.items[i].pane_id.clone());
-        self.preview.follow(following.as_deref());
+        self.preview
+            .follow(following.as_deref(), self.preview_max_age(chosen));
 
         let mut offset = self.offset;
         let view = View {
@@ -396,7 +472,35 @@ impl Popup {
             self.confirm_key(key, chosen);
             return true;
         }
+        if matches!(self.mode, Mode::Drive) {
+            self.drive_key(key, chosen);
+            return true;
+        }
         self.browse_key(key, chosen, pick.len())
+    }
+
+    /// Driving a pane: every key goes to it, so `q` and the arrows mean
+    /// whatever the session wants them to mean. The one key kept back is the
+    /// way out, or closing the popup would be the only escape.
+    fn drive_key(&mut self, key: KeyEvent, chosen: Option<usize>) {
+        if is_hand_back(key) {
+            self.mode = Mode::Browse;
+            return;
+        }
+        // A pane can be killed while it is being driven, and keys with nowhere
+        // to go would look like a popup that had stopped responding.
+        let Some(i) = chosen else {
+            self.mode = Mode::Browse;
+            return;
+        };
+        let pane = self.items[i].pane_id.clone();
+        match keystroke(key) {
+            Some(Keystroke::Text(c)) => tmux::send_text(&pane, &c.to_string()),
+            Some(Keystroke::Named(name)) => tmux::send_named_key(&pane, name),
+            None => return,
+        }
+        // A key with nothing visible behind it reads as a key that did nothing.
+        self.preview.expire();
     }
 
     /// Typing a reply to send to the selected session. The buffer is taken out
@@ -458,6 +562,12 @@ impl Popup {
                     self.mode = Mode::Prompt(String::new());
                 }
             }
+            KeyCode::Char('i') => {
+                if chosen.is_some() {
+                    self.mode = Mode::Drive;
+                    self.preview.expire();
+                }
+            }
             KeyCode::Char('x') => {
                 if chosen.is_some() {
                     self.mode = Mode::ConfirmKill;
@@ -490,7 +600,7 @@ fn event_loop() -> io::Result<()> {
     let mut popup = Popup::new();
     loop {
         popup.render(&mut terminal)?;
-        if event::poll(Duration::from_millis(300))? {
+        if event::poll(KEY_WAIT)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press && !popup.on_key(key) {
                     break;
@@ -696,6 +806,8 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
             Span::raw(" "),
             key("enter"),
             Span::raw(" jump   "),
+            key("i"),
+            Span::raw(" drive   "),
             key("p"),
             Span::raw(" prompt   "),
             key("x"),
@@ -719,6 +831,18 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
             ),
             Style::default().fg(Color::Indexed(196)),
         )),
+        Mode::Drive => Line::from(vec![
+            Span::styled(
+                format!(
+                    " driving {} ",
+                    v.chosen.map(|i| v.items[i].address.as_str()).unwrap_or("")
+                ),
+                Style::default().fg(Color::Indexed(208)),
+            ),
+            Span::raw("— keys go to the pane   "),
+            key("ctrl-g"),
+            Span::raw(" back"),
+        ]),
     };
     f.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
@@ -783,16 +907,88 @@ mod tests {
         preview.pane_id = "%1".to_string();
         preview.taken = Some(Instant::now());
         assert!(
-            !preview.is_due("%1"),
+            !preview.is_due("%1", PREVIEW_MAX_AGE),
             "a screen taken a moment ago is reused rather than taken again"
         );
 
         preview.expire();
 
         assert!(
-            preview.is_due("%1"),
+            preview.is_due("%1", PREVIEW_MAX_AGE),
             "refresh must beat the reuse window, or pressing it changes nothing on the screen"
         );
+    }
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn the_way_out_of_driving_is_a_key_a_terminal_spells_plainly() {
+        assert!(is_hand_back(press(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(
+            !is_hand_back(press(KeyCode::Char('g'), KeyModifiers::NONE)),
+            "a bare letter belongs to the pane being driven"
+        );
+        assert!(
+            !is_hand_back(press(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            "a terminal reports this as a digit, so watching for it would trap the keyboard"
+        );
+    }
+
+    #[test]
+    fn every_key_a_pane_needs_has_a_tmux_spelling() {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                keystroke(press(code, KeyModifiers::NONE)).is_some(),
+                "{code:?} has to reach the pane"
+            );
+        }
+        assert!(matches!(
+            keystroke(press(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Some(Keystroke::Text('1'))
+        ));
+        assert!(matches!(
+            keystroke(press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Keystroke::Named("C-c"))
+        ));
+    }
+
+    #[test]
+    fn a_blocked_session_is_watched_closely_and_a_quiet_one_is_not() {
+        let mut popup = Popup {
+            items: vec![item("codex", Kind::Session, 0)],
+            order: order(),
+            ai_count: 1,
+            cursor: 0,
+            offset: 0,
+            show_others: true,
+            mode: Mode::Browse,
+            preview: Preview::blank(),
+            cache: HashMap::new(),
+            last_refresh: Instant::now(),
+            jump: None,
+        };
+        assert_eq!(popup.preview_max_age(Some(0)), PREVIEW_MAX_AGE);
+
+        popup.items[0].status = Some(Status::Blocked);
+        assert_eq!(popup.preview_max_age(Some(0)), LIVE_PREVIEW_MAX_AGE);
+
+        popup.items[0].status = None;
+        popup.mode = Mode::Drive;
+        assert_eq!(popup.preview_max_age(Some(0)), LIVE_PREVIEW_MAX_AGE);
     }
 
     #[test]
@@ -800,12 +996,12 @@ mod tests {
         let mut preview = Preview::blank();
         preview.pane_id = "%1".to_string();
         preview.taken = Some(Instant::now());
-        assert!(preview.is_due("%2"));
+        assert!(preview.is_due("%2", PREVIEW_MAX_AGE));
     }
 
     #[test]
     fn a_preview_that_has_never_captured_is_due() {
-        assert!(Preview::blank().is_due("%1"));
+        assert!(Preview::blank().is_due("%1", PREVIEW_MAX_AGE));
     }
 
     #[test]

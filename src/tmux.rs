@@ -170,12 +170,22 @@ pub(crate) fn refresh_client() {
 /// know as a key name arrives as that key — "Space" becomes one space — and a
 /// prompt starting with a dash is read as a flag and never arrives at all.
 pub(crate) fn send_prompt(pane: &str, text: &str) {
-    fire(&prompt_args(pane, text));
+    send_text(pane, text);
     std::thread::sleep(SUBMIT_GAP);
-    fire(&["send-keys", "-t", pane, "Enter"]);
+    send_named_key(pane, "Enter");
 }
 
-fn prompt_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
+/// Types text into a pane without sending it.
+pub(crate) fn send_text(pane: &str, text: &str) {
+    fire(&text_args(pane, text));
+}
+
+/// Sends one key on, named the way tmux names keys: "Enter", "Up", "C-c".
+pub(crate) fn send_named_key(pane: &str, key: &str) {
+    fire(&["send-keys", "-t", pane, key]);
+}
+
+fn text_args<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
     ["send-keys", "-t", pane, "-l", "--", text]
 }
 
@@ -233,7 +243,7 @@ mod tests {
 
     #[test]
     fn a_prompt_is_sent_as_text_rather_than_as_keys() {
-        let args = prompt_args("%1", "Space");
+        let args = text_args("%1", "Space");
         assert!(
             args.contains(&"-l"),
             "a prompt tmux knows as a key name arrives as that key without this"
@@ -243,7 +253,7 @@ mod tests {
 
     #[test]
     fn a_prompt_starting_with_a_dash_is_not_read_as_a_flag() {
-        let args = prompt_args("%1", "-n never got sent");
+        let args = text_args("%1", "-n never got sent");
         let end_of_flags = args.iter().position(|a| *a == "--").expect("needs --");
         let text = args.len() - 1;
         assert!(
