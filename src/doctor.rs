@@ -1,6 +1,9 @@
 //! Checks atc's own installation. A check that says "ok" about a configuration
 //! which never actually runs is worse than no check at all, so each one here
 //! reports only what it was able to verify, and says so when it cannot tell.
+//!
+//! Each check prints its own line and returns how many problems it found, so
+//! doctor reads as the list of checks it runs.
 use crate::agent::{Confidence, Tool};
 use crate::state::PaneState;
 use crate::{process, state, tmux};
@@ -23,8 +26,6 @@ pub(crate) fn run() {
     }
 }
 
-/// Each check prints its own line and returns how many problems it found, so
-/// doctor reads as the list of checks it runs.
 fn check_tmux() -> u32 {
     if tmux::available() {
         println!("ok    tmux found");
@@ -126,15 +127,17 @@ fn check_agent(tool: Tool, tracked: &[PaneState]) -> u32 {
 /// that has actually reported, which is the difference between a hook that is
 /// written down and one that runs.
 fn report_delivery(reported: usize) {
+    const INDENT: &str = "               ";
     let note = match reported {
         0 => "no pane has reported through it yet".to_string(),
         1 => "1 pane has reported through it".to_string(),
         n => format!("{n} panes have reported through it"),
     };
-    println!("      {:<8} {note}", "");
+    println!("{INDENT}{note}");
 }
 
 /// How completely a tool's own config file registers atc's hooks.
+#[derive(Debug, PartialEq, Eq)]
 enum Registration {
     Complete,
     /// Wired for some events and not others, which is the shape a half-finished
@@ -157,14 +160,19 @@ fn registration(tool: Tool) -> Registration {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Registration::NoFile,
         Err(e) => return Registration::Unreadable(e.to_string()),
     };
-    let tree = match parse_config(tool, &body) {
-        Ok(t) => t,
-        Err(e) => return Registration::Unreadable(e),
-    };
-    if hooks_switched_off(&tree) {
+    match parse_config(tool, &body) {
+        Ok(tree) => classify(tool, &tree),
+        Err(unreadable) => unreadable,
+    }
+}
+
+/// What a config says about atc's hooks, judged apart from reading it, so the
+/// judgement can be tested without a home directory to put a file in.
+fn classify(tool: Tool, tree: &serde_json::Value) -> Registration {
+    if hooks_switched_off(tree) {
         return Registration::Disabled;
     }
-    let wired = events_reaching_atc(&tree);
+    let wired = events_reaching_atc(tree);
     if wired.is_empty() {
         return Registration::Absent;
     }
@@ -183,11 +191,15 @@ fn registration(tool: Tool) -> Registration {
 
 /// Codex writes TOML and the rest write JSON, but both describe the same
 /// shape, so reading them into one tree means the check below is written once.
-fn parse_config(tool: Tool, body: &str) -> Result<serde_json::Value, String> {
-    match tool {
+///
+/// The two formats fail with unrelated error types that nothing here could act
+/// on differently, so a failure becomes the reason to report and nothing more.
+fn parse_config(tool: Tool, body: &str) -> Result<serde_json::Value, Registration> {
+    let parsed = match tool {
         Tool::Codex => toml::from_str(body).map_err(|e| e.to_string()),
         _ => serde_json::from_str(body).map_err(|e| e.to_string()),
-    }
+    };
+    parsed.map_err(Registration::Unreadable)
 }
 
 fn hooks_switched_off(tree: &serde_json::Value) -> bool {
@@ -284,6 +296,47 @@ mod tests {
             );
         }
         assert!(!hooks_switched_off(&t));
+    }
+
+    #[test]
+    fn the_generated_codex_config_is_complete() {
+        let tree = parse_config(Tool::Codex, &crate::codex_hooks_toml()).expect("valid toml");
+        assert_eq!(classify(Tool::Codex, &tree), Registration::Complete);
+    }
+
+    #[test]
+    fn the_shape_atc_used_to_generate_registers_nothing() {
+        let flat = "[features]\nhooks = true\n\n[hooks]\n\
+                    Stop = [{ type = \"command\", command = \"atc hook --tool codex Stop\" }]\n";
+        let tree = parse_config(Tool::Codex, flat).expect("valid toml");
+        assert_eq!(
+            classify(Tool::Codex, &tree),
+            Registration::Absent,
+            "codex reads this without complaint and never runs it, so it must not pass"
+        );
+    }
+
+    #[test]
+    fn a_half_finished_install_names_what_is_missing() {
+        let tree = parse_config(
+            Tool::Codex,
+            "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\n\
+             type = \"command\"\ncommand = \"atc hook --tool codex Stop\"\n",
+        )
+        .expect("valid toml");
+        let Registration::Partial(missing) = classify(Tool::Codex, &tree) else {
+            panic!("one hook of many registered is a partial install");
+        };
+        assert!(missing.contains(&"SessionStart"));
+        assert!(!missing.contains(&"Stop"));
+    }
+
+    #[test]
+    fn hooks_turned_off_outrank_whatever_else_is_in_the_file() {
+        let mut body = String::from("[features]\nhooks = false\n");
+        body.push_str(&crate::codex_hooks_toml().replace("[features]\nhooks = true\n", ""));
+        let tree = parse_config(Tool::Codex, &body).expect("valid toml");
+        assert_eq!(classify(Tool::Codex, &tree), Registration::Disabled);
     }
 
     #[test]
