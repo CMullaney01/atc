@@ -1,17 +1,21 @@
 # atc
 
 Rust. The skills in `.claude/skills/` govern how this project is written — read
-them, don't re-derive the rules. `.claude/skills/INDEX.md` is the catalog.
+them, don't re-derive the rules. `.claude/skills/INDEX.md` is the catalog once
+they are installed; [`docs/skills.md`](docs/skills.md) is the committed version,
+and the one a fresh clone has.
 
-Load these three before writing any code here, every time:
+Load these three before writing any code here, every time — meaning every batch
+of Rust, not once per sitting:
 
 - `rex-code-philosophy` — complexity-averse, ergonomics-first; governs design decisions
 - `rex-code-ergonomics` — idiomatic Rust: naming, types, traits, iterators, panics, signatures
 - `rex-code-commenting` — the best comment is none; WHY only, never WHAT
 
-Then load whatever the task calls for from the index — `rex-code-tdd` for writing
-code, `rex-code-error-writing` for anything fallible, `rex-code-external-libraries`
+Then load whatever the task calls for — `rex-code-tdd` for writing code,
+`rex-code-error-writing` for anything fallible, `rex-code-external-libraries`
 before adding a crate, `rex-code-smells` for an audit.
+[`docs/skills.md`](docs/skills.md) lists the rest and when each one applies.
 
 ## Getting the skills onto a machine
 
