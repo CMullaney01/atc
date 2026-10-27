@@ -468,21 +468,19 @@ impl Popup {
         let was_on = self.selected_pane();
         self.view = self.view.other();
         match was_on {
-            Some(pane) if self.can_point_at(&pane) => self.point_at(&pane),
+            Some(pane) if self.point_at(&pane) => {}
             _ => self.point_at_what_most_needs_you(),
         }
     }
 
-    fn can_point_at(&self, pane_id: &str) -> bool {
+    /// Puts the cursor on a pane, saying whether this list had a row for it.
+    fn point_at(&mut self, pane_id: &str) -> bool {
         let (_, pick) = self.visible();
-        pick.iter().any(|i| self.items[*i].pane_id == pane_id)
-    }
-
-    fn point_at(&mut self, pane_id: &str) {
-        let (_, pick) = self.visible();
-        if let Some(at) = pick.iter().position(|i| self.items[*i].pane_id == pane_id) {
-            self.cursor = at;
-        }
+        let Some(at) = pick.iter().position(|i| self.items[*i].pane_id == pane_id) else {
+            return false;
+        };
+        self.cursor = at;
+        true
     }
 
     /// A pane can be killed while it is being driven, and keys with nowhere to
