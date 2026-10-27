@@ -90,14 +90,19 @@ Everything is jumpable, so the popup is also how you get back to the `nvim` or
 
 `i` goes further and **drives** the selected pane: every key you press from
 then on goes to it, so an approval gets answered — arrows, a digit, `y`,
-`enter`, `esc` to interrupt — while you watch the screen below. `ctrl-g` hands
-the keyboard back. Nothing about the agents' prompts is hardcoded, so this
-works the same for all four, and the preview tightens to 150ms while you're
-driving or sitting on a blocked session so a keypress never looks dead.
+`enter` — while you watch the screen below. `esc` hands the keyboard back.
+Nothing about the agents' prompts is hardcoded, so this works the same for all
+four, and the preview tightens to 150ms while you're driving or sitting on a
+blocked session so a keypress never looks dead.
+
+The one key that doesn't reach the pane is **`esc`**, because that is the way
+out. To interrupt a session while driving it press `ctrl-c`, which arrives as
+the interrupt a terminal already sends. The footer names both while you're in
+there, so nothing about this has to be remembered.
 
 The cursor opens on whatever most needs you, and `n` walks to the next session
 that does — blocked, waiting or errored, wrapping round, `N` to go back. So
-clearing three approvals is `n` `i` answer `ctrl-g`, three times, with no
+clearing three approvals is `n` `i` answer `esc`, three times, with no
 hunting. It's the same count the title reports, so `2 need you` means `n`
 visits two.
 
