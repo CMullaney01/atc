@@ -139,13 +139,11 @@ enum Keystroke {
 /// The key that stops a pane being driven and gives the popup its keyboard
 /// back.
 ///
-/// It has to be one a terminal reports as itself. Ctrl and a bracket arrive as
-/// the byte 0x1d, which is read as ctrl and a digit, so a popup watching for
-/// the bracket would never see it and the only way out would be to close the
-/// popup. Ctrl-g is in the range terminals spell plainly, and no agent wants
-/// it.
+/// Escape is kept back from the pane entirely, so a session is interrupted
+/// with ctrl-c instead. Both do the job in every agent, and escape is the one
+/// hand already reaches for to back out of something.
 fn is_hand_back(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL)
+    key.code == KeyCode::Esc
 }
 
 /// What a key pressed while driving a pane becomes. Anything with no tmux
@@ -162,7 +160,6 @@ fn keystroke(key: KeyEvent) -> Option<Keystroke> {
     match key.code {
         KeyCode::Char(c) => Some(Keystroke::Text(c)),
         KeyCode::Enter => Some(Keystroke::Named("Enter")),
-        KeyCode::Esc => Some(Keystroke::Named("Escape")),
         KeyCode::Tab => Some(Keystroke::Named("Tab")),
         KeyCode::BackTab => Some(Keystroke::Named("BTab")),
         KeyCode::Backspace => Some(Keystroke::Named("BSpace")),
@@ -926,7 +923,9 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
                 Style::default().fg(Color::Indexed(208)),
             ),
             Span::raw("— keys go to the pane   "),
-            key("ctrl-g"),
+            key("ctrl-c"),
+            Span::raw(" stop   "),
+            key("esc"),
             Span::raw(" back"),
         ]),
     };
@@ -1018,26 +1017,30 @@ mod tests {
     }
 
     #[test]
-    fn the_way_out_of_driving_is_a_key_a_terminal_spells_plainly() {
-        assert!(is_hand_back(press(
-            KeyCode::Char('g'),
-            KeyModifiers::CONTROL
-        )));
+    fn escape_is_the_way_out_of_driving() {
+        assert!(is_hand_back(press(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(
-            !is_hand_back(press(KeyCode::Char('g'), KeyModifiers::NONE)),
-            "a bare letter belongs to the pane being driven"
+            !is_hand_back(press(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            "ctrl-g belongs to the pane now that escape is the way out"
         );
+    }
+
+    #[test]
+    fn a_driven_session_is_stopped_with_ctrl_c_because_escape_never_arrives() {
         assert!(
-            !is_hand_back(press(KeyCode::Char(']'), KeyModifiers::CONTROL)),
-            "a terminal reports this as a digit, so watching for it would trap the keyboard"
+            keystroke(press(KeyCode::Esc, KeyModifiers::NONE)).is_none(),
+            "escape is kept back, so nothing should be able to forward it"
         );
+        assert!(matches!(
+            keystroke(press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Keystroke::Named("C-c"))
+        ));
     }
 
     #[test]
     fn every_key_a_pane_needs_has_a_tmux_spelling() {
         for code in [
             KeyCode::Enter,
-            KeyCode::Esc,
             KeyCode::Up,
             KeyCode::Down,
             KeyCode::Left,
@@ -1053,10 +1056,6 @@ mod tests {
         assert!(matches!(
             keystroke(press(KeyCode::Char('1'), KeyModifiers::NONE)),
             Some(Keystroke::Text('1'))
-        ));
-        assert!(matches!(
-            keystroke(press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            Some(Keystroke::Named("C-c"))
         ));
     }
 
