@@ -181,13 +181,12 @@ impl Order {
 
 /// Groups panes under the window and session they live in.
 ///
-/// Under triage, sessions lead with the one you are attached to and windows
-/// lead with whatever is most urgent, so the thing that needs you surfaces.
-/// Turned off, everything keeps tmux's own order and nothing moves on its own.
-/// Panes keep their on-screen order inside a window either way, so a session
-/// always appears next to whatever it shares a window with.
+/// Under triage the same rule runs at all three levels: sessions lead with
+/// the one you are attached to, windows lead with whatever is most urgent,
+/// and a window's panes lead with the agents. Turned off, everything keeps
+/// tmux's own order and nothing moves on its own.
 pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>, order: Order) -> Vec<TreeRow> {
-    let mut sessions = group_by_window(entries);
+    let mut sessions = group_by_window(entries, order);
     order_sessions(&mut sessions, entries, current_session, order);
 
     let mut out = Vec::new();
@@ -216,9 +215,13 @@ fn worst_of(entries: &[Entry], members: &[usize]) -> u8 {
         .unwrap_or(0)
 }
 
-/// Panes collected under their window, and windows under their session, with
-/// each window's panes in the order they sit on screen.
-fn group_by_window(entries: &[Entry]) -> Vec<SessionGroup> {
+/// Panes collected under their window, and windows under their session.
+///
+/// Under triage a window's panes keep the order the inventory put them in,
+/// which leads with the agents, so a session is never buried under the
+/// editor and the shells it shares a window with. Turned off they go back to
+/// the order they sit on screen.
+fn group_by_window(entries: &[Entry], order: Order) -> Vec<SessionGroup> {
     let mut windows: BTreeMap<(String, u32), (String, Vec<usize>)> = BTreeMap::new();
     for (i, e) in entries.iter().enumerate() {
         windows
@@ -230,7 +233,9 @@ fn group_by_window(entries: &[Entry]) -> Vec<SessionGroup> {
 
     let mut by_session: BTreeMap<String, Vec<WindowGroup>> = BTreeMap::new();
     for ((session, index), (name, mut members)) in windows {
-        members.sort_by_key(|i| entries[*i].info.pane_index);
+        if order == Order::AsTmux {
+            members.sort_by_key(|i| entries[*i].info.pane_index);
+        }
         by_session
             .entry(session)
             .or_default()
@@ -495,12 +500,44 @@ mod tests {
                 "session ws",
                 // window 0 holds the blocked pane, so it leads
                 "window 0 editor",
-                "pane %1",
                 "pane %2",
+                "pane %1",
                 "window 1 atc",
                 "pane %3",
             ],
-            "nvim must stay beside the session it shares window 0 with"
+            "nvim must stay in window 0, under the session it shares it with"
+        );
+    }
+
+    #[test]
+    fn a_window_leads_with_its_agents_and_not_with_the_editor() {
+        let panes = vec![
+            pane("%1", "ws", 0, "editor", 0, "nvim"),
+            pane("%2", "ws", 0, "editor", 1, "zsh"),
+            pane("%3", "ws", 0, "editor", 2, "zsh"),
+            pane("%4", "ws", 0, "editor", 3, "2.1.308"),
+        ];
+        let states = vec![st("%4", Status::Blocked)];
+        let inv = inventory(&states, &panes);
+
+        let panes_of = |rows: Vec<TreeRow>| -> Vec<String> {
+            rows.iter()
+                .filter_map(|r| match r {
+                    TreeRow::Pane(i) => Some(inv[*i].info.pane_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            panes_of(tree(&inv, Some("ws"), Order::Triage)),
+            ["%4", "%1", "%2", "%3"],
+            "the session wanting you leads the window it is buried in"
+        );
+        assert_eq!(
+            panes_of(tree(&inv, Some("ws"), Order::AsTmux)),
+            ["%1", "%2", "%3", "%4"],
+            "triage off keeps the panes where tmux put them"
         );
     }
 
