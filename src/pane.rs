@@ -101,6 +101,21 @@ pub(crate) fn detect_tool(info: &PaneInfo) -> Option<Tool> {
     (looks_like_a_version(&info.command) || titled_like_claude(&info.title)).then_some(Tool::Claude)
 }
 
+/// Whether a pane could still be running the agent its state describes.
+///
+/// An agent that exits without firing its last hook leaves state behind, and
+/// the pane lives on as a shell, an editor or an ordinary job while still
+/// carrying a session's glyph. State is only believed while the pane could
+/// still hold the thing that wrote it.
+///
+/// An interpreter counts: an agent installed from npm runs as one, and the
+/// command line that says which agent is not always readable. Being wrong
+/// that way leaves a stale glyph, where being wrong the other way hides a
+/// session that is genuinely waiting for you.
+pub(crate) fn could_be_running_an_agent(info: &PaneInfo) -> bool {
+    detect_tool(info).is_some() || is_interpreter(base_command(&info.command))
+}
+
 /// The claude binary is named after its version, so a pane running it reports
 /// a command like "2.1.308" rather than anything recognisable.
 fn looks_like_a_version(cmd: &str) -> bool {
@@ -155,10 +170,32 @@ mod tests {
         }
     }
 
+    /// Whether the state still belongs to the pane is settled before this is
+    /// called, so anything that gets here is state to be trusted.
     #[test]
     fn hook_state_wins_over_everything() {
         let st = PaneState::new("%1");
         assert_eq!(classify(&pane("", "zsh"), Some(&st)), Kind::Session);
+    }
+
+    #[test]
+    fn a_pane_stops_carrying_state_once_it_is_plainly_something_else() {
+        for cmd in ["zsh", "nvim", "caffeinate", "cargo", "less"] {
+            assert!(
+                !could_be_running_an_agent(&pane("", cmd)),
+                "{cmd} is not an agent, so a leftover state file must not speak for it"
+            );
+        }
+        for cmd in ["2.1.308", "codex", "node", "bun"] {
+            assert!(
+                could_be_running_an_agent(&pane("", cmd)),
+                "{cmd} could still be an agent, so its state stands"
+            );
+        }
+        assert!(
+            could_be_running_an_agent(&node_pane("")),
+            "an npm agent whose command line could not be read keeps its state"
+        );
     }
 
     #[test]
