@@ -22,6 +22,19 @@ export ATC
 rm -rf "$ATC_STATE_DIR"
 mkdir -p "$ATC_STATE_DIR"
 
+# A demo pane has to be detectable as its agent, not just report like one, so
+# each one runs a binary named the way that agent names itself. Claude's is
+# named after its version, which is the whole reason atc has a rule for that.
+export DEMO_BIN=${DEMO_BIN:-${TMPDIR:-/tmp}/atc-demo-bin}
+rm -rf "$DEMO_BIN"
+mkdir -p "$DEMO_BIN"
+RUSTC=${RUSTC:-$(command -v rustc || echo "$HOME/.cargo/bin/rustc")}
+"$RUSTC" -O -o "$DEMO_BIN/base" "$HERE/sleeper.rs"
+for name in 2.1.308 codex gemini copilot; do
+    cp "$DEMO_BIN/base" "$DEMO_BIN/$name"
+done
+rm "$DEMO_BIN/base"
+
 $TM kill-server 2>/dev/null || true
 sleep 0.3
 
@@ -33,8 +46,15 @@ agent() { # <target> <tool> <title> <screen> <event>...
 
 # The server inherits the exported variable, so its status bar and every pane
 # it spawns read the same isolated state.
-$TM -f "$HERE/demo.conf" new-session -d -s myworkspace -n editor -c "$REPO" -x 200 -y 50
+# tmux takes a path and nothing else, so the two in the config are filled in
+# here rather than written down. Otherwise the demo only records on the one
+# machine whose home directory got committed.
+CONF=$DEMO_BIN/demo.conf
+sed -e "s|__REPO__|$REPO|g" -e "s|__ATC__|$ATC|g" "$HERE/demo.conf" > "$CONF"
+
+$TM -f "$CONF" new-session -d -s myworkspace -n editor -c "$REPO" -x 200 -y 50
 $TM set-environment -g ATC_STATE_DIR "$ATC_STATE_DIR"
+$TM set-environment -g DEMO_BIN "$DEMO_BIN"
 
 # A real editor and a real git TUI, so the rows atc calls "tool" are genuinely
 # that rather than something dressed up as one.
@@ -75,4 +95,15 @@ $TM select-window -t myworkspace:atc
 $TM select-pane -t myworkspace:atc.0
 # Through the server, so sync talks to this socket rather than the real one.
 $TM run-shell "$ATC sync"
-echo "staged: $($TM list-panes -a | wc -l | tr -d ' ') panes, state in $ATC_STATE_DIR"
+
+# Every glyph in the recording comes from one of those hooks, so a hook that
+# did not run is a recording of the wrong thing. Six agents were staged; if
+# six did not report, say so rather than record a fleet of jobs.
+AGENTS=6
+reported=$(find "$ATC_STATE_DIR" -name '*.json' | wc -l | tr -d ' ')
+if [ "$reported" -ne "$AGENTS" ]; then
+    echo "only $reported of $AGENTS agents reported through their hooks" >&2
+    exit 1
+fi
+echo "staged: $($TM list-panes -a | wc -l | tr -d ' ') panes, \
+$reported agents reported, state in $ATC_STATE_DIR"

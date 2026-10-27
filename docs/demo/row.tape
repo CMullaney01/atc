@@ -5,7 +5,7 @@
 
 # The stills are the point here; the GIF is a by-product, so it is written
 # outside the repo rather than committed.
-Output /tmp/atc-row-toggle.gif
+Output "/tmp/atc-row-toggle.gif"
 
 Require tmux
 

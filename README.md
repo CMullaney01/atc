@@ -233,7 +233,12 @@ something happens to it.
 - Every hook ends with `refresh-client -S`, so the bar updates the instant a
   session stops rather than on the next status interval.
 - The row reconciles against `tmux list-panes` on every render, so a killed
-  pane can't leave a ghost glyph behind.
+  pane can't leave a ghost glyph behind. A pane that outlives the agent in it
+  can't either: state is only believed while the pane could still be running
+  the thing that wrote it, so an agent that exits without firing its last hook
+  leaves a shell, not a session. The file is left alone rather than deleted,
+  because a pane briefly reports a pager the agent opened and a glyph that
+  comes back on its own beats state thrown away for good.
 - The one thing read rather than reported is an **unreported** pane's screen.
   The row redraws every two seconds, so each such pane is captured that often,
   up to twelve per render. A fleet where everything has reported captures
@@ -297,9 +302,8 @@ atc ask "which session has been waiting longest, and what did it last say?"
 
 ## The screenshots
 
-Everything above is a real tmux session whose state was written by the agents'
-own hooks — nothing is mocked up. `docs/demo/` rebuilds that fleet and
-re-records the lot:
+Everything above is a real tmux session, and `docs/demo/` rebuilds that fleet
+and re-records the lot:
 
 ```sh
 brew install vhs
@@ -309,6 +313,19 @@ vhs docs/demo/row.tape     # the status row, colour and mono
 
 It runs on its own tmux socket and its own `ATC_STATE_DIR`, so recording can't
 disturb a live session — and a live session can't disturb the recording.
+
+Worth being exact about what is real in those pictures, since it is the whole
+basis for believing them. **Every glyph comes from a hook.** Each demo pane
+calls `atc hook` the same way the agent itself would, through the same code,
+and staging fails rather than records if six agents do not report. The
+editor, the git TUI and the cold `cargo build` are genuinely those things, and
+each agent pane runs a process named the way that agent names itself, so the
+rows are detected rather than declared.
+
+What stands in: an agent's **screen** is a transcript in `docs/demo/screens/`,
+and behind it sits a program that does nothing but stay alive. Running four
+real agents to the same point on every take is not reproducible, and a picture
+of a fleet has to be.
 
 ## Licence
 

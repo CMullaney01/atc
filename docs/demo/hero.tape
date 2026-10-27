@@ -48,20 +48,21 @@ Sleep 2s
 
 # tab drops everything that is not an agent.
 Tab
-Sleep 2500ms
+Sleep 3s
 Screenshot docs/img/popup-agents.png
+# Room between the shot and the toggle back: the screenshots are written when
+# the recording ends, and a key pressed right after one lands in it.
+Sleep 2s
 Tab
 Sleep 1500ms
 
-# Back up to the blocked one and jump straight into it. It is in another
-# window, so the layout behind the popup changes with you.
-Type "k"
-Sleep 500ms
-Type "k"
-Sleep 500ms
-Type "k"
-Sleep 500ms
-Type "k"
+# Back to the blocked one and jump straight into it. It is in another window,
+# so the layout behind the popup changes with you.
+#
+# `g` rather than counting keys back up: triage floats the most urgent window
+# to the top of the session you are attached to, so the first row is the thing
+# that most wants you however the fleet is arranged.
+Type "g"
 Sleep 1800ms
 Enter
 Sleep 3500ms
