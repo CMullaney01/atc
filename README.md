@@ -62,9 +62,13 @@ dismisses it.
 
 Grouped the way your tmux actually is — session, then window, then the panes
 in it — so a session always appears next to whatever it shares a window with
-and you can see which terminal belongs to what. Windows lead with whatever is
-most urgent, and the session you're attached to comes first, so the thing that
-wants you still rises to the top.
+and you can see which terminal belongs to what.
+
+Inside that grouping the same rule runs at all three levels: the session
+you're attached to comes first, windows lead with whatever is most urgent, and
+a window leads with its agents. A window holding `nvim`, two shells and a
+blocked claude lists the claude first, rather than fourth behind the things
+you weren't looking for.
 
 That reordering is **triage**, and it's on by default. The cost is that the
 list moves as the fleet does, so a row can shift under your cursor the moment
