@@ -577,7 +577,7 @@ impl Popup {
 
     /// Driving a pane: every key goes to it, so `q` and the arrows mean
     /// whatever the session wants them to mean. The one key kept back is the
-    /// way out, or closing the popup would be the only escape.
+    /// way out, or closing the popup would be the only way to stop.
     fn drive_key(&mut self, key: KeyEvent, pane: &str) {
         if is_hand_back(key) {
             self.mode = Mode::Browse;

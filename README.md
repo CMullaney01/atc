@@ -96,8 +96,9 @@ four, and the preview tightens to 150ms while you're driving or sitting on a
 blocked session so a keypress never looks dead.
 
 The one key that doesn't reach the pane is **`esc`**, because that is the way
-out. To interrupt a session while driving it, press `ctrl-c` — every one of the
-four stops on it, and the footer says so while you're in there.
+out. To interrupt a session while driving it press `ctrl-c`, which arrives as
+the interrupt a terminal already sends. The footer names both while you're in
+there, so nothing about this has to be remembered.
 
 The cursor opens on whatever most needs you, and `n` walks to the next session
 that does — blocked, waiting or errored, wrapping round, `N` to go back. So
