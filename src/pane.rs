@@ -160,6 +160,7 @@ mod tests {
             path: "/tmp".to_string(),
             tty: "ttys001".to_string(),
             argv: String::new(),
+            infer: String::new(),
         }
     }
 

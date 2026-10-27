@@ -27,6 +27,9 @@ pub(crate) struct PaneInfo {
     /// The full command line, but only for a pane running an interpreter —
     /// empty for every other pane, since nothing else needs it.
     pub(crate) argv: String,
+    /// What the last look at this pane's screen concluded, as written by
+    /// whoever looked. Empty for a pane nobody has had to guess about.
+    pub(crate) infer: String,
 }
 
 impl PaneInfo {
@@ -63,7 +66,8 @@ pub(crate) fn list_panes() -> Vec<PaneInfo> {
         "#{{pane_id}}{s}#{{session_name}}{s}#{{window_index}}{s}#{{window_name}}{s}\
          #{{pane_index}}{s}#{{?pane_active,1,0}}{s}#{{?window_active,1,0}}{s}\
          #{{?session_attached,1,0}}{s}#{{pane_title}}{s}\
-         #{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_tty}}",
+         #{{pane_current_command}}{s}#{{pane_current_path}}{s}#{{pane_tty}}{s}\
+         #{{@atc_infer}}",
         s = SEP
     );
     let Some(out) = run(&["list-panes", "-a", "-F", &fmt]) else {
@@ -93,7 +97,7 @@ fn fill_command_lines(panes: &mut [PaneInfo]) {
 
 fn parse_pane_line(line: &str) -> Option<PaneInfo> {
     let f: Vec<&str> = line.split(SEP).collect();
-    if f.len() < 12 {
+    if f.len() < 13 {
         return None;
     }
     Some(PaneInfo {
@@ -110,6 +114,7 @@ fn parse_pane_line(line: &str) -> Option<PaneInfo> {
         path: f[10].to_string(),
         tty: f[11].trim_start_matches("/dev/").to_string(),
         argv: String::new(),
+        infer: f[12].to_string(),
     })
 }
 
@@ -131,6 +136,30 @@ pub(crate) fn current_session() -> Option<String> {
 /// the containing window, which avoids quoting window names.
 pub(crate) fn set_pane_option(pane: &str, key: &str, value: &str) {
     fire(&["set-option", "-p", "-t", pane, key, value]);
+}
+
+/// Sets one option across several panes in a single tmux invocation.
+///
+/// A round trip per pane is exactly the cost the screen-capture budget exists
+/// to keep off the status row, so bookkeeping for a whole pass must not cost
+/// one each. tmux takes `;` as a command separator when it arrives as its own
+/// argument.
+pub(crate) fn set_pane_option_on_each(key: &str, values: &[(String, String)]) {
+    if values.is_empty() {
+        return;
+    }
+    fire(&each_pane_args(key, values));
+}
+
+fn each_pane_args<'a>(key: &'a str, values: &'a [(String, String)]) -> Vec<&'a str> {
+    let mut args: Vec<&str> = Vec::new();
+    for (i, (pane, value)) in values.iter().enumerate() {
+        if i > 0 {
+            args.push(";");
+        }
+        args.extend(["set-option", "-p", "-t", pane, key, value]);
+    }
+    args
 }
 
 pub(crate) fn unset_pane_option(pane: &str, key: &str) {
@@ -278,7 +307,7 @@ mod tests {
     fn parses_a_pane_line() {
         let line = format!(
             "%6{s}myworkspace{s}0{s}nvim{s}1{s}1{s}1{s}1{s}✳ fix-lint{s}2.1.308\
-             {s}/Users/c/dev/atc{s}/dev/ttys004",
+             {s}/Users/c/dev/atc{s}/dev/ttys004{s}1793100000|blocked",
             s = SEP
         );
         let p = parse_pane_line(&line).expect("should parse");
@@ -297,12 +326,13 @@ mod tests {
         // Stored the way `ps` reports it, so a pane can be matched to its
         // process without re-trimming at every use.
         assert_eq!(p.tty, "ttys004");
+        assert_eq!(p.infer, "1793100000|blocked");
     }
 
     #[test]
     fn an_active_pane_in_a_background_window_is_not_current() {
         let line = format!(
-            "%9{s}ws{s}2{s}other{s}0{s}1{s}0{s}1{s}title{s}zsh{s}/tmp{s}/dev/ttys009",
+            "%9{s}ws{s}2{s}other{s}0{s}1{s}0{s}1{s}title{s}zsh{s}/tmp{s}/dev/ttys009{s}",
             s = SEP
         );
         let p = parse_pane_line(&line).expect("should parse");
@@ -313,6 +343,34 @@ mod tests {
     #[test]
     fn rejects_truncated_lines() {
         assert!(parse_pane_line("%6\u{1f}only\u{1f}three").is_none());
+    }
+
+    #[test]
+    fn one_invocation_carries_every_panes_bookkeeping() {
+        let values = [
+            ("%1".to_string(), "10|blocked".to_string()),
+            ("%2".to_string(), "10|".to_string()),
+        ];
+        let args = each_pane_args("@atc_infer", &values);
+        assert_eq!(
+            args,
+            [
+                "set-option",
+                "-p",
+                "-t",
+                "%1",
+                "@atc_infer",
+                "10|blocked",
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                "%2",
+                "@atc_infer",
+                "10|"
+            ],
+            "a round trip per pane is the cost this exists to avoid"
+        );
     }
 
     #[test]

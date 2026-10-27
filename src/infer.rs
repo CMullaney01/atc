@@ -4,7 +4,7 @@
 use crate::agent::Tool;
 use crate::bar::Entry;
 use crate::pane::Kind;
-use crate::state::Status;
+use crate::state::{self, Status};
 use crate::tmux;
 
 /// Capturing a screen costs a tmux round trip, so a workspace full of
@@ -64,21 +64,75 @@ pub(crate) fn from_screen(lines: &[String], tool: Tool) -> Option<Status> {
     None
 }
 
+/// What a pane's last screen check concluded, and when.
+///
+/// Written as `<seconds>|<status>`, with the status left empty for a screen
+/// that said nothing recognisable — which is a different thing from never
+/// having looked, and has to survive as its own answer.
+fn read_look(raw: &str) -> Option<(u64, Option<Status>)> {
+    let (at, status) = raw.split_once('|')?;
+    Some((at.parse().ok()?, Status::parse(status)))
+}
+
+fn write_look(at: u64, status: Option<Status>) -> String {
+    format!("{at}|{}", status.map(Status::label).unwrap_or(""))
+}
+
+/// When this pane was last looked at, treating one never looked at as the
+/// oldest there is so it goes to the front of the queue.
+fn looked_at(raw: &str) -> u64 {
+    read_look(raw).map_or(0, |(at, _)| at)
+}
+
+/// Which panes to spend this pass's screen captures on: the ones looked at
+/// longest ago.
+///
+/// The bug this replaces took the first twelve every time and started again
+/// from the beginning on the next pass, so a thirteenth unreported pane was
+/// never looked at once, however long it sat there. Going by how stale each
+/// one is means every pane comes round, and raising the budget is not what
+/// stands between a fleet and the truth.
+fn stalest_first(entries: &[Entry], budget: usize) -> Vec<usize> {
+    let mut due: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| needs_a_guess(e))
+        .map(|(i, _)| i)
+        .collect();
+    due.sort_by_key(|i| looked_at(&entries[*i].info.infer));
+    due.truncate(budget);
+    due
+}
+
+fn needs_a_guess(e: &Entry) -> bool {
+    e.kind == Kind::Unreported && e.state.is_none()
+}
+
 /// Fills in a status for the panes that look like AI sessions but have reported
 /// nothing. Panes with real state are left alone.
+///
+/// Capturing a screen costs a tmux round trip, so only a few panes are looked
+/// at per pass. The rest keep the answer from the last time they were looked
+/// at, which is why a bounded budget does not turn into a row of question
+/// marks on a fleet bigger than the budget.
 pub(crate) fn decorate(entries: &mut [Entry]) {
-    let mut budget = MAX_CAPTURES;
     for e in entries.iter_mut() {
-        if budget == 0 {
-            return;
+        if needs_a_guess(e) {
+            e.inferred = read_look(&e.info.infer).and_then(|(_, status)| status);
         }
-        if e.kind != Kind::Unreported || e.state.is_some() {
-            continue;
-        }
-        budget -= 1;
+    }
+
+    let now = state::now();
+    let mut looked: Vec<(String, String)> = Vec::new();
+    for i in stalest_first(entries, MAX_CAPTURES) {
+        let e = &mut entries[i];
         let Some(tool) = e.tool() else { continue };
         e.inferred = from_screen(&tmux::capture_pane(&e.info.pane_id), tool);
+        // The time has to be written even when the answer has not changed, or
+        // this pane stays the stalest one and the pass never moves on.
+        looked.push((e.info.pane_id.clone(), write_look(now, e.inferred)));
     }
+    tmux::set_pane_option_on_each("@atc_infer", &looked);
 }
 
 #[cfg(test)]
@@ -87,6 +141,104 @@ mod tests {
 
     fn screen(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    fn unreported(pane_id: &str, infer: &str) -> crate::tmux::PaneInfo {
+        crate::tmux::PaneInfo {
+            pane_id: pane_id.to_string(),
+            session: "ws".to_string(),
+            window_index: 0,
+            window_name: "w".to_string(),
+            pane_index: 0,
+            active: false,
+            window_active: false,
+            session_attached: false,
+            title: String::new(),
+            command: "codex".to_string(),
+            path: "/tmp".to_string(),
+            tty: "ttys001".to_string(),
+            argv: String::new(),
+            infer: infer.to_string(),
+        }
+    }
+
+    fn entries(infos: &[crate::tmux::PaneInfo]) -> Vec<Entry<'_>> {
+        infos
+            .iter()
+            .map(|info| Entry {
+                info,
+                state: None,
+                kind: Kind::Unreported,
+                inferred: None,
+            })
+            .collect()
+    }
+
+    /// The bug this guards left a pane showing `?` for as long as it existed.
+    /// With fifteen unreported panes and a budget of twelve, the last three
+    /// were never looked at once: every pass started from the beginning.
+    #[test]
+    fn a_pane_past_the_budget_still_comes_round() {
+        let infos: Vec<_> = (0..15)
+            .map(|i| unreported(&format!("%{i}"), "100|"))
+            .collect();
+        let inv = entries(&infos);
+
+        let first = stalest_first(&inv, MAX_CAPTURES);
+        assert_eq!(first.len(), MAX_CAPTURES);
+        assert!(
+            !first.contains(&14),
+            "the last pane loses the first pass, which is fine"
+        );
+
+        // What the next pass sees once this one has written its times.
+        let after: Vec<_> = (0..15)
+            .map(|i| {
+                let looked = if first.contains(&i) { "200|" } else { "100|" };
+                unreported(&format!("%{i}"), looked)
+            })
+            .collect();
+        let second = stalest_first(&entries(&after), MAX_CAPTURES);
+        for late in [12, 13, 14] {
+            assert!(
+                second.contains(&late),
+                "pane {late} waited a pass, so it must lead the next one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_nobody_has_looked_at_goes_first() {
+        let infos = [
+            unreported("%1", "500|working"),
+            unreported("%2", ""),
+            unreported("%3", "100|blocked"),
+        ];
+        assert_eq!(
+            stalest_first(&entries(&infos), 2),
+            vec![1, 2],
+            "never looked at beats looked at long ago, which beats looked at recently"
+        );
+    }
+
+    #[test]
+    fn a_pane_waiting_its_turn_keeps_the_last_answer() {
+        assert_eq!(read_look("100|blocked"), Some((100, Some(Status::Blocked))));
+        assert_eq!(
+            read_look("100|"),
+            Some((100, None)),
+            "a screen that said nothing recognisable is an answer, not a gap"
+        );
+        assert_eq!(read_look(""), None, "nobody has looked at this one");
+        assert_eq!(read_look("nonsense"), None);
+    }
+
+    #[test]
+    fn a_look_survives_being_written_down_and_read_back() {
+        for status in [Some(Status::Blocked), Some(Status::Working), None] {
+            let raw = write_look(1_793_100_000, status);
+            assert_eq!(read_look(&raw), Some((1_793_100_000, status)), "{raw}");
+        }
     }
 
     #[test]
