@@ -90,14 +90,23 @@ impl Entry<'_> {
 }
 
 /// Every pane tmux reports, classified, most urgent first. The pane list is the
-/// source of truth, so panes that never fired a hook still appear and state for
-/// panes that no longer exist cannot produce a ghost.
+/// source of truth, so panes that never fired a hook still appear, state for
+/// panes that no longer exist cannot produce a ghost, and neither can state a
+/// pane has outlived.
+///
+/// Outlived state is left on disk rather than deleted. A pane can report
+/// something other than its agent for a moment — a pager the agent opened
+/// holds the terminal — and a glyph that comes back on its own is better than
+/// a session whose state was thrown away.
 pub(crate) fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> Vec<Entry<'a>> {
     let by_id: HashMap<&str, &PaneState> = states.iter().map(|s| (s.pane_id.as_str(), s)).collect();
     let mut out: Vec<Entry<'a>> = panes
         .iter()
         .map(|info| {
-            let state = by_id.get(info.pane_id.as_str()).copied();
+            let state = by_id
+                .get(info.pane_id.as_str())
+                .copied()
+                .filter(|_| pane::could_be_running_an_agent(info));
             Entry {
                 info,
                 state,
@@ -467,6 +476,31 @@ mod tests {
         let mut s = PaneState::new(id);
         s.status = status;
         s
+    }
+
+    /// The bug this guards put a blocked glyph on a pane that had been
+    /// running an unrelated command for a day: the agent exited without a
+    /// last hook, so nothing ever took its state away.
+    #[test]
+    fn a_pane_that_outlived_its_agent_shows_what_it_is_now() {
+        let panes = vec![
+            pane("%1", "ws", 0, "w", 0, "caffeinate"),
+            pane("%2", "ws", 0, "w", 1, "2.1.308"),
+        ];
+        let states = vec![st("%1", Status::Blocked), st("%2", Status::Blocked)];
+        let inv = inventory(&states, &panes);
+
+        let outlived = inv.iter().find(|e| e.info.pane_id == "%1").unwrap();
+        assert_eq!(outlived.kind, Kind::Job);
+        assert_eq!(
+            outlived.status(),
+            None,
+            "a leftover state file must not speak for a pane that moved on"
+        );
+
+        let live = inv.iter().find(|e| e.info.pane_id == "%2").unwrap();
+        assert_eq!(live.kind, Kind::Session);
+        assert_eq!(live.status(), Some(Status::Blocked), "this one is real");
     }
 
     #[test]
