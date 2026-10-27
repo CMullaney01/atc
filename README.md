@@ -58,26 +58,25 @@ bind-key A if-shell -F '#{==:#{@atc_colour},off}' \
 `prefix + a` opens it over the top of your layout. Nothing resizes, and `q`
 dismisses it.
 
-![The command center: sessions grouped by tmux session and window, with a live preview](docs/img/popup.png)
+![The command center: every AI session, worst first, with a live preview](docs/img/popup.png)
 
-Grouped the way your tmux actually is — session, then window, then the panes
-in it — so a session always appears next to whatever it shares a window with
-and you can see which terminal belongs to what.
+It holds **two lists**, and `tab` swaps between them. They answer different
+questions, which is why neither is the other with a filter on it.
 
-Inside that grouping the same rule runs at all three levels: the session
-you're attached to comes first, windows lead with whatever is most urgent, and
-a window leads with its agents. A window holding `nvim`, two shells and a
-blocked claude lists the claude first, rather than fourth behind the things
-you weren't looking for.
+The **agent list** is what opens, because clearing approvals is why you
+pressed the key. Every AI session, flat, worst first — blocked at the top,
+working at the bottom — and nothing else at all. No headings to scroll past,
+no editors, no shells, no subagents: every line is somewhere `n` can stop and
+`i` can drive. You come in, clear what is waiting, and leave.
 
-That reordering is **triage**, and it's on by default. The cost is that the
-list moves as the fleet does, so a row can shift under your cursor the moment
-something goes blocked. Turn it off and the list keeps tmux's own order, where
-nothing ever moves on its own:
+The **tree** is the map of your workspace, in the order tmux itself holds it:
+sessions by name, windows by index, panes where they sit on screen. Nothing
+reorders, ever, so a pane is always where you last saw it — which is what you
+want when you are navigating rather than triaging. Editors, shells and running
+jobs are all in it, because the popup is also how you get back to `nvim` or
+`k9s`.
 
-```sh
-set -g @atc_triage off
-```
+![The tree: every pane, grouped the way tmux holds it](docs/img/popup-tree.png)
 
 | Column | |
 |---|---|
@@ -110,24 +109,21 @@ clearing three approvals is `n` `i` answer `esc`, three times, with no
 hunting. It's the same count the title reports, so `2 need you` means `n`
 visits two.
 
-Driving holds **the pane you chose**, not whatever the cursor is on. The list
-rebuilds every second and triage can reorder it while you're mid-approval, so
-the selection is anchored to its pane and nothing can redirect a keystroke to
-a session you didn't pick.
-
-Non-AI panes — editors, shells, running jobs — are listed too, because the
-popup is where you go to navigate. `tab` drops them when you only care about
-the fleet:
-
-![The same view with tab pressed, showing agents only](docs/img/popup-agents.png)
+Driving holds **the pane you chose**, not whatever the cursor is on. The agent
+list rebuilds every second and a session going blocked floats it up the list
+while you're mid-approval, so the selection is anchored to its pane and
+nothing can redirect a keystroke to a session you didn't pick. `tab` keeps
+hold of it too; when the list you land in has no row for it — a shell has none
+in the agent list — the cursor takes whatever most wants you instead.
 
 `enter` jumps. The window behind the popup changes with you:
 
 ![After jumping: now in the review window, with the blocked codex session](docs/img/jumped.png)
 
 `⑂` rows are the subagents running under a session, with how long each has
-been going. They aren't panes, so `j`/`k` step over them and `enter`, `p` and
-`x` never land on one.
+been going. They live in the tree, where the question is what is going on.
+They aren't panes, so `j`/`k` step over them and `enter`, `p` and `x` never
+land on one — which is also why the agent list leaves them out entirely.
 
 ## States
 
@@ -233,7 +229,12 @@ something happens to it.
 - Every hook ends with `refresh-client -S`, so the bar updates the instant a
   session stops rather than on the next status interval.
 - The row reconciles against `tmux list-panes` on every render, so a killed
-  pane can't leave a ghost glyph behind.
+  pane can't leave a ghost glyph behind. A pane that outlives the agent in it
+  can't either: state is only believed while the pane could still be running
+  the thing that wrote it, so an agent that exits without firing its last hook
+  leaves a shell, not a session. The file is left alone rather than deleted,
+  because a pane briefly reports a pager the agent opened and a glyph that
+  comes back on its own beats state thrown away for good.
 - The one thing read rather than reported is an **unreported** pane's screen.
   The row redraws every two seconds, so each such pane is captured that often,
   up to twelve per render. A fleet where everything has reported captures
@@ -297,9 +298,8 @@ atc ask "which session has been waiting longest, and what did it last say?"
 
 ## The screenshots
 
-Everything above is a real tmux session whose state was written by the agents'
-own hooks — nothing is mocked up. `docs/demo/` rebuilds that fleet and
-re-records the lot:
+Everything above is a real tmux session, and `docs/demo/` rebuilds that fleet
+and re-records the lot:
 
 ```sh
 brew install vhs
@@ -309,6 +309,19 @@ vhs docs/demo/row.tape     # the status row, colour and mono
 
 It runs on its own tmux socket and its own `ATC_STATE_DIR`, so recording can't
 disturb a live session — and a live session can't disturb the recording.
+
+Worth being exact about what is real in those pictures, since it is the whole
+basis for believing them. **Every glyph comes from a hook.** Each demo pane
+calls `atc hook` the same way the agent itself would, through the same code,
+and staging fails rather than records if six agents do not report. The
+editor, the git TUI and the cold `cargo build` are genuinely those things, and
+each agent pane runs a process named the way that agent names itself, so the
+rows are detected rather than declared.
+
+What stands in: an agent's **screen** is a transcript in `docs/demo/screens/`,
+and behind it sits a program that does nothing but stay alive. Running four
+real agents to the same point on every take is not reproducible, and a picture
+of a fleet has to be.
 
 ## Licence
 

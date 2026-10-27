@@ -166,47 +166,16 @@ fn switched_off(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("off" | "0" | "no" | "false"))
 }
 
-/// Whether the fleet is listed with whatever wants you first, or in the order
-/// tmux itself holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Order {
-    Triage,
-    AsTmux,
-}
-
-impl Order {
-    pub(crate) fn from_tmux() -> Self {
-        Self::read(tmux::global_option("@atc_triage").as_deref())
-    }
-
-    fn read(value: Option<&str>) -> Self {
-        if switched_off(value) {
-            Order::AsTmux
-        } else {
-            Order::Triage
-        }
-    }
-}
-
-/// Groups panes under the window and session they live in.
+/// Groups panes under the window and session they live in, in the order tmux
+/// itself holds them.
 ///
-/// Under triage the same rule runs at all three levels: sessions lead with
-/// the one you are attached to, windows lead with whatever is most urgent,
-/// and a window's panes lead with the agents. Turned off, everything keeps
-/// tmux's own order and nothing moves on its own.
-pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>, order: Order) -> Vec<TreeRow> {
-    let mut sessions = group_by_window(entries, order);
-    order_sessions(&mut sessions, entries, current_session, order);
-
+/// Nothing here reorders by urgency. This is the map of how the workspace is
+/// laid out, so a pane is always where you left it; the agent list is where
+/// whatever wants you comes to the top.
+pub(crate) fn tree(entries: &[Entry]) -> Vec<TreeRow> {
     let mut out = Vec::new();
-    for (session, mut windows) in sessions {
+    for (session, windows) in group_by_window(entries) {
         out.push(TreeRow::Session(session));
-        windows.sort_by(|a, b| match order {
-            Order::Triage => worst_of(entries, &b.2)
-                .cmp(&worst_of(entries, &a.2))
-                .then(a.0.cmp(&b.0)),
-            Order::AsTmux => a.0.cmp(&b.0),
-        });
         for (index, name, members) in windows {
             out.push(TreeRow::Window { index, name });
             out.extend(members.into_iter().map(TreeRow::Pane));
@@ -215,22 +184,9 @@ pub(crate) fn tree(entries: &[Entry], current_session: Option<&str>, order: Orde
     out
 }
 
-/// How much the most urgent pane in a group wants you.
-fn worst_of(entries: &[Entry], members: &[usize]) -> u8 {
-    members
-        .iter()
-        .map(|i| entries[*i].urgency())
-        .max()
-        .unwrap_or(0)
-}
-
-/// Panes collected under their window, and windows under their session.
-///
-/// Under triage a window's panes keep the order the inventory put them in,
-/// which leads with the agents, so a session is never buried under the
-/// editor and the shells it shares a window with. Turned off they go back to
-/// the order they sit on screen.
-fn group_by_window(entries: &[Entry], order: Order) -> Vec<SessionGroup> {
+/// Sessions by name, windows by index, panes by the order they sit on screen.
+/// The maps are sorted, so the first two fall out of the keys.
+fn group_by_window(entries: &[Entry]) -> Vec<SessionGroup> {
     let mut windows: BTreeMap<(String, u32), (String, Vec<usize>)> = BTreeMap::new();
     for (i, e) in entries.iter().enumerate() {
         windows
@@ -242,43 +198,13 @@ fn group_by_window(entries: &[Entry], order: Order) -> Vec<SessionGroup> {
 
     let mut by_session: BTreeMap<String, Vec<WindowGroup>> = BTreeMap::new();
     for ((session, index), (name, mut members)) in windows {
-        if order == Order::AsTmux {
-            members.sort_by_key(|i| entries[*i].info.pane_index);
-        }
+        members.sort_by_key(|i| entries[*i].info.pane_index);
         by_session
             .entry(session)
             .or_default()
             .push((index, name, members));
     }
     by_session.into_iter().collect()
-}
-
-/// The session you are attached to leads, then whichever holds the most urgent
-/// pane, then by name so the order never wobbles between redraws.
-fn order_sessions(
-    sessions: &mut [SessionGroup],
-    entries: &[Entry],
-    current: Option<&str>,
-    order: Order,
-) {
-    if order == Order::AsTmux {
-        sessions.sort_by(|a, b| a.0.cmp(&b.0));
-        return;
-    }
-    sessions.sort_by(|a, b| {
-        let mine = |name: &str| u8::from(current.is_some_and(|c| c == name));
-        let worst_in = |windows: &Vec<WindowGroup>| {
-            windows
-                .iter()
-                .map(|w| worst_of(entries, &w.2))
-                .max()
-                .unwrap_or(0)
-        };
-        mine(&b.0)
-            .cmp(&mine(&a.0))
-            .then(worst_in(&b.1).cmp(&worst_in(&a.1)))
-            .then(a.0.cmp(&b.0))
-    });
 }
 
 /// Marks a state worked out from a pane's screen rather than reported by a
@@ -508,18 +434,21 @@ mod tests {
         assert_eq!(live.status(), Some(Status::Blocked), "this one is real");
     }
 
+    /// The tree is the map of the workspace, so urgency must not touch it.
+    /// Whatever wants you comes to the top of the agent list instead.
     #[test]
-    fn the_tree_keeps_a_window_together_and_floats_the_urgent_one_up() {
+    fn the_tree_is_the_layout_in_the_order_tmux_holds_it() {
         let panes = vec![
             pane("%1", "ws", 0, "editor", 0, "nvim"),
             pane("%2", "ws", 0, "editor", 1, "2.1.308"),
             pane("%3", "ws", 1, "atc", 0, "2.1.308"),
         ];
+        // The most urgent pane is the last one in its window, and the window
+        // holding the quiet one comes first. Neither may move.
         let states = vec![st("%3", Status::Working), st("%2", Status::Blocked)];
         let inv = inventory(&states, &panes);
-        let rows = tree(&inv, Some("ws"), Order::Triage);
 
-        let shape: Vec<String> = rows
+        let shape: Vec<String> = tree(&inv)
             .iter()
             .map(|r| match r {
                 TreeRow::Session(n) => format!("session {n}"),
@@ -532,82 +461,33 @@ mod tests {
             shape,
             [
                 "session ws",
-                // window 0 holds the blocked pane, so it leads
                 "window 0 editor",
-                "pane %2",
                 "pane %1",
+                "pane %2",
                 "window 1 atc",
                 "pane %3",
             ],
-            "nvim must stay in window 0, under the session it shares it with"
+            "every row is where tmux put it, blocked or not"
         );
     }
 
     #[test]
-    fn a_window_leads_with_its_agents_and_not_with_the_editor() {
+    fn sessions_are_listed_by_name_not_by_which_one_you_are_in() {
         let panes = vec![
-            pane("%1", "ws", 0, "editor", 0, "nvim"),
-            pane("%2", "ws", 0, "editor", 1, "zsh"),
-            pane("%3", "ws", 0, "editor", 2, "zsh"),
-            pane("%4", "ws", 0, "editor", 3, "2.1.308"),
+            pane("%1", "aaa", 0, "w", 0, "2.1.308"),
+            pane("%2", "zzz", 0, "w", 0, "2.1.308"),
         ];
-        let states = vec![st("%4", Status::Blocked)];
+        // The one you are attached to is the quiet one, and it sorts last.
+        let states = vec![st("%2", Status::Blocked), st("%1", Status::Idle)];
         let inv = inventory(&states, &panes);
-
-        let panes_of = |rows: Vec<TreeRow>| -> Vec<String> {
-            rows.iter()
-                .filter_map(|r| match r {
-                    TreeRow::Pane(i) => Some(inv[*i].info.pane_id.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
-
-        assert_eq!(
-            panes_of(tree(&inv, Some("ws"), Order::Triage)),
-            ["%4", "%1", "%2", "%3"],
-            "the session wanting you leads the window it is buried in"
-        );
-        assert_eq!(
-            panes_of(tree(&inv, Some("ws"), Order::AsTmux)),
-            ["%1", "%2", "%3", "%4"],
-            "triage off keeps the panes where tmux put them"
-        );
-    }
-
-    #[test]
-    fn triage_off_leaves_the_urgent_window_where_tmux_put_it() {
-        let panes = vec![
-            pane("%1", "ws", 0, "editor", 0, "2.1.308"),
-            pane("%2", "ws", 1, "atc", 0, "2.1.308"),
-        ];
-        let states = vec![st("%2", Status::Blocked)];
-        let inv = inventory(&states, &panes);
-
-        let triaged = tree(&inv, Some("ws"), Order::Triage);
-        let as_tmux = tree(&inv, Some("ws"), Order::AsTmux);
-
-        let leads = |rows: &[TreeRow]| match &rows[1] {
-            TreeRow::Window { index, .. } => *index,
-            other => panic!("a session is followed by a window, got {other:?}"),
-        };
-        assert_eq!(leads(&triaged), 1, "the blocked window rises under triage");
-        assert_eq!(leads(&as_tmux), 0, "nothing moves with triage off");
-    }
-
-    #[test]
-    fn the_attached_session_comes_first_however_quiet_it_is() {
-        let panes = vec![
-            pane("%1", "other", 0, "zsh", 0, "2.1.308"),
-            pane("%2", "mine", 0, "zsh", 0, "2.1.308"),
-        ];
-        let states = vec![st("%1", Status::Blocked), st("%2", Status::Idle)];
-        let inv = inventory(&states, &panes);
-        let rows = tree(&inv, Some("mine"), Order::Triage);
-        match &rows[0] {
-            TreeRow::Session(n) => assert_eq!(n, "mine"),
-            _ => panic!("a session heading should lead"),
-        }
+        let names: Vec<String> = tree(&inv)
+            .iter()
+            .filter_map(|r| match r {
+                TreeRow::Session(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["aaa", "zzz"]);
     }
 
     #[test]
@@ -808,17 +688,13 @@ mod tests {
         );
     }
 
-    /// Both options are read the same way on purpose: an option that honoured
-    /// "0" while its neighbour only honoured "off" would be a trap.
     #[test]
     fn only_an_explicit_refusal_turns_an_option_off() {
         for off in ["off", "0", "no", "false", " off "] {
             assert_eq!(Paint::read(Some(off)), Paint::Mono, "{off:?}");
-            assert_eq!(Order::read(Some(off)), Order::AsTmux, "{off:?}");
         }
         for on in [None, Some(""), Some("on"), Some("yes"), Some("anything")] {
             assert_eq!(Paint::read(on), Paint::Colour, "{on:?}");
-            assert_eq!(Order::read(on), Order::Triage, "{on:?}");
         }
     }
 

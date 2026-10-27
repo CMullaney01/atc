@@ -175,6 +175,26 @@ fn keystroke(key: KeyEvent) -> Option<Keystroke> {
     }
 }
 
+/// Which of the two lists the popup is showing.
+///
+/// They answer different questions, which is why neither can be the other
+/// with a filter on it: the tree is where a pane *is*, laid out the way tmux
+/// holds it, and the agent list is what wants *you*, worst first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Agents,
+    Tree,
+}
+
+impl View {
+    fn other(self) -> Self {
+        match self {
+            View::Agents => View::Tree,
+            View::Tree => View::Agents,
+        }
+    }
+}
+
 /// One drawn line. Only `Pane` can be selected — the rest are structure, and a
 /// subagent is not a pane, so jumping to or killing one means nothing.
 enum Row {
@@ -233,18 +253,35 @@ impl Preview {
     }
 }
 
-/// Turns the workspace order into drawn lines, dropping panes that are not AI
-/// sessions when they are hidden, along with any window or session left empty.
-fn build_rows(items: &[Item], order: &[TreeRow], show_others: bool) -> Vec<Row> {
+/// Turns the fleet into drawn lines, in whichever shape the popup is showing.
+fn build_rows(items: &[Item], order: &[TreeRow], view: View) -> Vec<Row> {
+    match view {
+        View::Agents => agent_rows(items),
+        View::Tree => tree_rows(items, order),
+    }
+}
+
+/// Every AI session, flat, worst first.
+///
+/// No headings and no subagents: this is the list you step through to clear
+/// approvals, so every line has to be somewhere `n` can stop and `i` can
+/// drive. The inventory is already sorted by how much each wants you, which
+/// puts blocked at the top and working at the bottom.
+fn agent_rows(items: &[Item]) -> Vec<Row> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.kind.is_ai())
+        .map(|(i, _)| Row::Pane(i))
+        .collect()
+}
+
+fn tree_rows(items: &[Item], order: &[TreeRow]) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
     for row in order {
         match row {
-            TreeRow::Session(name) => {
-                drop_empty_session(&mut out);
-                out.push(Row::Session(name.clone()));
-            }
+            TreeRow::Session(name) => out.push(Row::Session(name.clone())),
             TreeRow::Window { index, name } => {
-                drop_empty_window(&mut out);
                 out.push(Row::Window {
                     index: *index,
                     name: name.clone(),
@@ -252,9 +289,6 @@ fn build_rows(items: &[Item], order: &[TreeRow], show_others: bool) -> Vec<Row> 
             }
             TreeRow::Pane(i) => {
                 let item = &items[*i];
-                if !show_others && !item.kind.is_ai() {
-                    continue;
-                }
                 out.push(Row::Pane(*i));
                 for agent in 0..item.subagents.len() {
                     out.push(Row::Subagent { parent: *i, agent });
@@ -262,23 +296,7 @@ fn build_rows(items: &[Item], order: &[TreeRow], show_others: bool) -> Vec<Row> 
             }
         }
     }
-    drop_empty_session(&mut out);
     out
-}
-
-/// A window heading that gained no panes under it should not be drawn.
-fn drop_empty_window(out: &mut Vec<Row>) {
-    if matches!(out.last(), Some(Row::Window { .. })) {
-        out.pop();
-    }
-}
-
-/// Nor should a session heading that gained no windows.
-fn drop_empty_session(out: &mut Vec<Row>) {
-    drop_empty_window(out);
-    if matches!(out.last(), Some(Row::Session(_))) {
-        out.pop();
-    }
 }
 
 /// The item indices that can be selected, in the order they are drawn.
@@ -344,11 +362,7 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, Vec<Tree
     let panes = tmux::list_panes();
     let mut inv = bar::inventory(&states, &panes);
     infer::decorate(&mut inv);
-    let order = bar::tree(
-        &inv,
-        tmux::current_session().as_deref(),
-        bar::Order::from_tmux(),
-    );
+    let order = bar::tree(&inv);
     let ai_count = inv.iter().filter(|e| e.kind.is_ai()).count();
     let items = inv
         .iter()
@@ -392,7 +406,7 @@ struct Popup {
     ai_count: usize,
     cursor: usize,
     offset: usize,
-    show_others: bool,
+    view: View,
     mode: Mode,
     preview: Preview,
     cache: HashMap<String, Option<String>>,
@@ -411,7 +425,7 @@ impl Popup {
             ai_count,
             cursor: 0,
             offset: 0,
-            show_others: true,
+            view: View::Agents,
             mode: Mode::Browse,
             preview: Preview::blank(),
             cache,
@@ -444,11 +458,29 @@ impl Popup {
             .map(|i| self.items[*i].pane_id.clone())
     }
 
-    fn point_at(&mut self, pane_id: &str) {
-        let (_, pick) = self.visible();
-        if let Some(at) = pick.iter().position(|i| self.items[*i].pane_id == pane_id) {
-            self.cursor = at;
+    /// Switches list, keeping hold of the session you were on.
+    ///
+    /// The two lists hold different things, so the pane you were looking at
+    /// may not be in the one you land in — a shell has no row in the agent
+    /// list. Then the cursor goes to whatever most wants you, which is what
+    /// you came to the agent list for anyway.
+    fn switch_view(&mut self) {
+        let was_on = self.selected_pane();
+        self.view = self.view.other();
+        match was_on {
+            Some(pane) if self.point_at(&pane) => {}
+            _ => self.point_at_what_most_needs_you(),
         }
+    }
+
+    /// Puts the cursor on a pane, saying whether this list had a row for it.
+    fn point_at(&mut self, pane_id: &str) -> bool {
+        let (_, pick) = self.visible();
+        let Some(at) = pick.iter().position(|i| self.items[*i].pane_id == pane_id) else {
+            return false;
+        };
+        self.cursor = at;
+        true
     }
 
     /// A pane can be killed while it is being driven, and keys with nowhere to
@@ -524,7 +556,7 @@ impl Popup {
 
     /// The drawn lines and, of those, the item indices the cursor can land on.
     fn visible(&self) -> (Vec<Row>, Vec<usize>) {
-        let rows = build_rows(&self.items, &self.order, self.show_others);
+        let rows = build_rows(&self.items, &self.order, self.view);
         let pick = selectable(&rows);
         (rows, pick)
     }
@@ -539,17 +571,17 @@ impl Popup {
             .follow(following.as_deref(), self.preview_max_age(chosen));
 
         let mut offset = self.offset;
-        let view = View {
+        let frame = Frame {
             items: &self.items,
             rows: &rows,
             chosen,
             ai_count: self.ai_count,
-            hidden: self.items.len() - pick.len(),
+            view: self.view,
             mode: &self.mode,
             preview: &self.preview,
         };
         terminal.draw(|f| {
-            offset = draw(f, &view, offset);
+            offset = draw(f, &frame, offset);
         })?;
         self.offset = offset;
         Ok(())
@@ -643,7 +675,7 @@ impl Popup {
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Char('g') => self.cursor = 0,
             KeyCode::Char('G') => self.cursor = count.saturating_sub(1),
-            KeyCode::Tab => self.show_others = !self.show_others,
+            KeyCode::Tab => self.switch_view(),
             KeyCode::Char('r') => self.force_reload(),
             KeyCode::Char('p') => {
                 // Only an AI session can take a prompt.
@@ -778,12 +810,12 @@ fn subagent_line(agent: &Subagent) -> Line<'static> {
     ])
 }
 
-struct View<'a> {
+struct Frame<'a> {
     items: &'a [Item],
     rows: &'a [Row],
     chosen: Option<usize>,
     ai_count: usize,
-    hidden: usize,
+    view: View,
     mode: &'a Mode,
     preview: &'a Preview,
 }
@@ -791,7 +823,7 @@ struct View<'a> {
 /// Returns the scroll offset it settled on, so the next frame starts where this
 /// one left off.
 /// The visible slice of the tree, as drawn lines.
-fn list_lines<'a>(v: &'a View, offset: usize, list_height: usize) -> Vec<Line<'a>> {
+fn list_lines<'a>(v: &'a Frame, offset: usize, list_height: usize) -> Vec<Line<'a>> {
     let mut lines: Vec<Line> = Vec::new();
     if v.ai_count == 0 {
         lines.push(Line::from(Span::styled(
@@ -818,7 +850,7 @@ fn list_lines<'a>(v: &'a View, offset: usize, list_height: usize) -> Vec<Line<'a
     lines
 }
 
-fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
+fn draw(f: &mut ratatui::Frame, v: &Frame, offset: usize) -> usize {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(3)])
@@ -835,13 +867,16 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
     let lines = list_lines(v, offset, list_height);
 
     let needs_you = v.items.iter().filter(|i| i.needs_you()).count();
-    let title = if v.hidden > 0 {
-        format!(
-            " atc — {} session(s), {needs_you} need you, {} pane(s) hidden ",
-            v.ai_count, v.hidden
-        )
-    } else {
-        format!(" atc — {} session(s), {needs_you} need you ", v.ai_count)
+    let title = match v.view {
+        View::Agents => format!(
+            " atc — {} session(s), {needs_you} need you — agents ",
+            v.ai_count
+        ),
+        View::Tree => format!(
+            " atc — {} session(s), {needs_you} need you — {} pane(s) ",
+            v.ai_count,
+            v.items.len()
+        ),
     };
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
@@ -853,7 +888,7 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
     offset
 }
 
-fn draw_preview(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
+fn draw_preview(f: &mut ratatui::Frame, v: &Frame, area: ratatui::layout::Rect) {
     let chosen = v.chosen.map(|i| &v.items[i]);
     let title = match chosen {
         Some(item) => match &item.repo {
@@ -880,7 +915,7 @@ fn draw_preview(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
     );
 }
 
-fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
+fn draw_footer(f: &mut ratatui::Frame, v: &Frame, area: ratatui::layout::Rect) {
     let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Indexed(75)));
     let footer = match v.mode {
         Mode::Browse => Line::from(vec![
@@ -896,7 +931,12 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
             key("x"),
             Span::raw(" kill   "),
             key("tab"),
-            Span::raw(" other panes   "),
+            // Named for where it takes you, not for what it does, so the way
+            // back is on the screen you would be looking for it from.
+            Span::raw(match v.view {
+                View::Agents => " all panes   ",
+                View::Tree => " agents   ",
+            }),
             key("r"),
             Span::raw(" refresh   "),
             key("q"),
@@ -1067,7 +1107,7 @@ mod tests {
             ai_count,
             cursor: 0,
             offset: 0,
-            show_others: true,
+            view: View::Agents,
             mode: Mode::Browse,
             preview: Preview::blank(),
             cache: HashMap::new(),
@@ -1099,22 +1139,15 @@ mod tests {
     #[test]
     fn the_selection_follows_the_pane_and_not_its_position() {
         let items = vec![
-            session("first", Status::Blocked),
+            session("first", Status::Waiting),
             session("second", Status::Working),
         ];
         let mut popup = popup_of(items, panes_in_order(2));
         assert_eq!(popup.selected_pane().as_deref(), Some("%first"));
 
-        // What a reload does when triage floats the other session up.
-        popup.order = vec![
-            TreeRow::Session("ws".to_string()),
-            TreeRow::Window {
-                index: 0,
-                name: "editor".to_string(),
-            },
-            TreeRow::Pane(1),
-            TreeRow::Pane(0),
-        ];
+        // What a reload does when the other session goes blocked and the
+        // inventory floats it above the one you were on.
+        popup.items.swap(0, 1);
         assert_eq!(
             popup.selected_pane().as_deref(),
             Some("%second"),
@@ -1123,6 +1156,35 @@ mod tests {
 
         popup.point_at("%first");
         assert_eq!(popup.selected_pane().as_deref(), Some("%first"));
+    }
+
+    #[test]
+    fn switching_list_keeps_the_session_you_were_on() {
+        let items = vec![
+            session("codex", Status::Blocked),
+            item("nvim", Kind::Tool, 0),
+        ];
+        let mut popup = popup_of(items, panes_in_order(2));
+        assert_eq!(popup.view, View::Agents);
+        assert_eq!(popup.selected_pane().as_deref(), Some("%codex"));
+
+        popup.switch_view();
+        assert_eq!(popup.view, View::Tree);
+        assert_eq!(
+            popup.selected_pane().as_deref(),
+            Some("%codex"),
+            "the same session, now shown where it sits in the layout"
+        );
+
+        // Only the tree has a row for an editor, so going back has to land
+        // somewhere.
+        popup.point_at("%nvim");
+        popup.switch_view();
+        assert_eq!(
+            popup.selected_pane().as_deref(),
+            Some("%codex"),
+            "an editor has no row in the agent list, so the cursor takes what wants you"
+        );
     }
 
     #[test]
@@ -1227,7 +1289,7 @@ mod tests {
             item("claude", Kind::Session, 2),
             item("zsh", Kind::Shell, 0),
         ];
-        let rows = build_rows(&items, &order(), true);
+        let rows = build_rows(&items, &order(), View::Tree);
         assert!(matches!(rows[2], Row::Pane(0)));
         assert!(matches!(rows[3], Row::Subagent { parent: 0, .. }));
         assert!(matches!(rows[4], Row::Subagent { parent: 0, .. }));
@@ -1236,21 +1298,20 @@ mod tests {
     }
 
     #[test]
-    fn hiding_other_panes_drops_the_window_it_empties() {
-        let items = vec![item("nvim", Kind::Tool, 0)];
-        let only = vec![
-            TreeRow::Session("ws".to_string()),
-            TreeRow::Window {
-                index: 0,
-                name: "editor".to_string(),
-            },
-            TreeRow::Pane(0),
+    fn the_agent_list_is_flat_and_holds_only_what_you_can_answer() {
+        let items = vec![
+            item("claude", Kind::Session, 2),
+            item("nvim", Kind::Tool, 0),
+            item("zsh", Kind::Shell, 0),
         ];
-        assert_eq!(build_rows(&items, &only, true).len(), 3);
-        assert!(
-            build_rows(&items, &only, false).is_empty(),
-            "a session with nothing left in it should not be drawn"
+        let rows = build_rows(&items, &order(), View::Agents);
+        assert_eq!(
+            rows.len(),
+            1,
+            "no headings, no editor, no shell, and no subagent rows"
         );
+        assert!(matches!(rows[0], Row::Pane(0)));
+        assert_eq!(selectable(&rows), vec![0]);
     }
 
     #[test]
@@ -1259,7 +1320,7 @@ mod tests {
             item("claude", Kind::Session, 2),
             item("zsh", Kind::Shell, 0),
         ];
-        let rows = build_rows(&items, &order(), true);
+        let rows = build_rows(&items, &order(), View::Tree);
         assert_eq!(row_of(&rows, Some(0)), 2);
         assert_eq!(row_of(&rows, Some(1)), 5);
         assert_eq!(row_of(&rows, None), 0);

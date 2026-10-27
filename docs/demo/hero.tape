@@ -33,36 +33,35 @@ Sleep 3s
 Ctrl+A
 Type "a"
 Sleep 3s
+
+# It opens on the agent list: every session, worst first, nothing else in it.
 Screenshot docs/img/popup.png
-
-# The cursor opens on whatever is most urgent. Walking down it, the bottom
-# half is the selected pane's live screen, so the preview follows.
-Type "j"
-Sleep 2s
-Type "j"
-Sleep 2s
-Type "j"
-Sleep 2s
-Type "j"
+# The screenshots are written when the recording ends, so a key pressed right
+# after one lands in it. Every shot needs room after it before the next key.
 Sleep 2s
 
-# tab drops everything that is not an agent.
+# Walking it, the bottom half is the selected pane's live screen, so the
+# preview follows. These are the sessions you would be clearing.
+Type "j"
+Sleep 2s
+Type "j"
+Sleep 2s
+Type "j"
+Sleep 2s
+
+# tab swaps to the tree: every pane, in the order tmux holds it.
 Tab
-Sleep 2500ms
-Screenshot docs/img/popup-agents.png
-Tab
-Sleep 1500ms
+Sleep 3s
+Screenshot docs/img/popup-tree.png
+Sleep 2s
 
-# Back up to the blocked one and jump straight into it. It is in another
+# Back to the agent list, where `g` is the worst thing in the fleet because
+# the list is sorted that way. Then jump straight into it -- it is in another
 # window, so the layout behind the popup changes with you.
-Type "k"
-Sleep 500ms
-Type "k"
-Sleep 500ms
-Type "k"
-Sleep 500ms
-Type "k"
-Sleep 1800ms
+Tab
+Sleep 2s
+Type "g"
+Sleep 2s
 Enter
 Sleep 3500ms
 Screenshot docs/img/jumped.png
