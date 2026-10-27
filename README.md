@@ -205,8 +205,9 @@ options means it's blocked, and a bare input box means it's waiting for you.
 Anything it doesn't recognise stays unknown.
 
 These are guesses about a current interface, not a contract, so they're marked
-`~` everywhere they appear, a real hook always wins, and nothing inferred is
-ever written to disk.
+`~` everywhere they appear and a real hook always wins. Nothing inferred is
+written to disk: the most recent guess is cached on the pane itself, where it
+dies with the pane and can never be mistaken for something a hook reported.
 
 ## How it works
 
@@ -236,9 +237,18 @@ something happens to it.
   because a pane briefly reports a pager the agent opened and a glyph that
   comes back on its own beats state thrown away for good.
 - The one thing read rather than reported is an **unreported** pane's screen.
-  The row redraws every two seconds, so each such pane is captured that often,
-  up to twelve per render. A fleet where everything has reported captures
-  nothing at all.
+  A fleet where everything has reported captures nothing at all.
+- Twelve screens per redraw is the cap, and the twelve are whichever were
+  looked at **longest ago**. A fixed twelve taken from the top of the list
+  would mean a thirteenth unreported pane was never looked at once, however
+  long it sat there — it showed `?` while its screen plainly said otherwise.
+  Going by staleness means every pane comes round, so the cap bounds how
+  *often* a pane is checked rather than whether it ever is. Raising the cap
+  would only move that cliff to a bigger fleet.
+- Between its turns a pane keeps the answer from its last look, held in a tmux
+  pane option, so a bounded budget doesn't turn a large fleet into a row of
+  question marks. A pane's options die with the pane, so nothing outlives what
+  it described.
 
 ## Install
 
