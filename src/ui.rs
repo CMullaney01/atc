@@ -17,6 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
@@ -51,6 +52,24 @@ struct Item {
 }
 
 impl Item {
+    fn urgency(&self) -> u8 {
+        self.status.map(Status::urgency).unwrap_or(0)
+    }
+
+    /// Whether this session is one the fleet is waiting on you for, which is
+    /// what the popup exists to find.
+    ///
+    /// The count in the title, where the cursor opens and what `n` walks all
+    /// ask this, so they cannot come to different answers about how many
+    /// sessions want you.
+    fn needs_you(&self) -> bool {
+        self.kind.is_ai()
+            && matches!(
+                self.status,
+                Some(Status::Waiting | Status::Blocked | Status::Error)
+            )
+    }
+
     fn glyph(&self) -> &'static str {
         match self.status {
             Some(s) => s.glyph(),
@@ -92,9 +111,21 @@ enum Mode {
     Browse,
     Prompt(String),
     ConfirmKill,
-    /// Keys go to the selected pane rather than to the popup, which is how an
-    /// approval gets answered without leaving the fleet.
-    Drive,
+    /// Keys go to the pane named here rather than to the popup, which is how
+    /// an approval gets answered without leaving the fleet.
+    ///
+    /// It holds the pane itself rather than asking where the cursor is. The
+    /// list rebuilds on a timer and can come back in a different order, and
+    /// reading the cursor each keystroke meant an answer could land in a
+    /// session nobody had chosen.
+    Drive(String),
+}
+
+/// Which way to look for the next session that wants you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    Forwards,
+    Backwards,
 }
 
 /// One keystroke on its way to a pane. tmux asks for a key by name, but a
@@ -377,7 +408,7 @@ impl Popup {
     fn new() -> Self {
         let mut cache = HashMap::new();
         let (items, order, ai_count) = snapshot(&mut cache);
-        Popup {
+        let mut popup = Popup {
             items,
             order,
             ai_count,
@@ -389,15 +420,82 @@ impl Popup {
             cache,
             last_refresh: Instant::now(),
             jump: None,
-        }
+        };
+        popup.point_at_what_most_needs_you();
+        popup
     }
 
     fn reload(&mut self) {
+        let was_on = self.selected_pane();
         let (items, order, ai_count) = snapshot(&mut self.cache);
         self.items = items;
         self.order = order;
         self.ai_count = ai_count;
         self.last_refresh = Instant::now();
+        if let Some(pane) = was_on {
+            self.point_at(&pane);
+        }
+        self.stop_driving_a_pane_that_has_gone();
+    }
+
+    /// The pane the cursor is on, as the pane rather than as a position, so a
+    /// list that comes back in a different order does not move the selection
+    /// to a different session.
+    fn selected_pane(&self) -> Option<String> {
+        let (_, pick) = self.visible();
+        pick.get(self.cursor)
+            .map(|i| self.items[*i].pane_id.clone())
+    }
+
+    fn point_at(&mut self, pane_id: &str) {
+        let (_, pick) = self.visible();
+        if let Some(at) = pick.iter().position(|i| self.items[*i].pane_id == pane_id) {
+            self.cursor = at;
+        }
+    }
+
+    /// A pane can be killed while it is being driven, and keys with nowhere to
+    /// go would look like a popup that had stopped responding.
+    fn stop_driving_a_pane_that_has_gone(&mut self) {
+        let Mode::Drive(pane) = &self.mode else {
+            return;
+        };
+        if !self.items.iter().any(|item| item.pane_id == *pane) {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// Where the cursor starts, and where `n` takes it: the highest urgency
+    /// there is, and the earliest of those, so a run of approvals is one key
+    /// apart rather than a hunt through the fleet.
+    fn point_at_what_most_needs_you(&mut self) {
+        let (_, pick) = self.visible();
+        let best = pick
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| self.items[**i].needs_you())
+            .min_by_key(|(at, i)| (Reverse(self.items[**i].urgency()), *at));
+        if let Some((at, _)) = best {
+            self.cursor = at;
+        }
+    }
+
+    fn point_at_next_needing_you(&mut self, scan: Scan) {
+        let (_, pick) = self.visible();
+        if pick.is_empty() {
+            return;
+        }
+        let count = pick.len();
+        let step = |offset: usize| match scan {
+            Scan::Forwards => (self.cursor + offset) % count,
+            Scan::Backwards => (self.cursor + count - offset) % count,
+        };
+        if let Some(at) = (1..=count)
+            .map(step)
+            .find(|at| self.items[pick[*at]].needs_you())
+        {
+            self.cursor = at;
+        }
     }
 
     fn refresh_if_stale(&mut self) {
@@ -418,7 +516,7 @@ impl Popup {
     /// Capturing a screen shells out to tmux, so the fleet is watched at a
     /// gentle rate and only the pane being acted on is watched closely.
     fn preview_max_age(&self, chosen: Option<usize>) -> Duration {
-        let driving = matches!(self.mode, Mode::Drive);
+        let driving = matches!(self.mode, Mode::Drive(_));
         let waiting_on_me = chosen.is_some_and(|i| self.items[i].status == Some(Status::Blocked));
         if driving || waiting_on_me {
             LIVE_PREVIEW_MAX_AGE
@@ -472,8 +570,9 @@ impl Popup {
             self.confirm_key(key, chosen);
             return true;
         }
-        if matches!(self.mode, Mode::Drive) {
-            self.drive_key(key, chosen);
+        if let Mode::Drive(pane) = &self.mode {
+            let pane = pane.clone();
+            self.drive_key(key, &pane);
             return true;
         }
         self.browse_key(key, chosen, pick.len())
@@ -482,21 +581,14 @@ impl Popup {
     /// Driving a pane: every key goes to it, so `q` and the arrows mean
     /// whatever the session wants them to mean. The one key kept back is the
     /// way out, or closing the popup would be the only escape.
-    fn drive_key(&mut self, key: KeyEvent, chosen: Option<usize>) {
+    fn drive_key(&mut self, key: KeyEvent, pane: &str) {
         if is_hand_back(key) {
             self.mode = Mode::Browse;
             return;
         }
-        // A pane can be killed while it is being driven, and keys with nowhere
-        // to go would look like a popup that had stopped responding.
-        let Some(i) = chosen else {
-            self.mode = Mode::Browse;
-            return;
-        };
-        let pane = self.items[i].pane_id.clone();
         match keystroke(key) {
-            Some(Keystroke::Text(c)) => tmux::send_text(&pane, &c.to_string()),
-            Some(Keystroke::Named(name)) => tmux::send_named_key(&pane, name),
+            Some(Keystroke::Text(c)) => tmux::send_text(pane, &c.to_string()),
+            Some(Keystroke::Named(name)) => tmux::send_named_key(pane, name),
             None => return,
         }
         // A key with nothing visible behind it reads as a key that did nothing.
@@ -563,11 +655,13 @@ impl Popup {
                 }
             }
             KeyCode::Char('i') => {
-                if chosen.is_some() {
-                    self.mode = Mode::Drive;
+                if let Some(i) = chosen {
+                    self.mode = Mode::Drive(self.items[i].pane_id.clone());
                     self.preview.expire();
                 }
             }
+            KeyCode::Char('n') => self.point_at_next_needing_you(Scan::Forwards),
+            KeyCode::Char('N') => self.point_at_next_needing_you(Scan::Backwards),
             KeyCode::Char('x') => {
                 if chosen.is_some() {
                     self.mode = Mode::ConfirmKill;
@@ -743,17 +837,7 @@ fn draw(f: &mut ratatui::Frame, v: &View, offset: usize) -> usize {
 
     let lines = list_lines(v, offset, list_height);
 
-    let needs_you = v
-        .items
-        .iter()
-        .filter(|i| {
-            i.kind.is_ai()
-                && matches!(
-                    i.status,
-                    Some(Status::Waiting | Status::Blocked | Status::Error)
-                )
-        })
-        .count();
+    let needs_you = v.items.iter().filter(|i| i.needs_you()).count();
     let title = if v.hidden > 0 {
         format!(
             " atc — {} session(s), {needs_you} need you, {} pane(s) hidden ",
@@ -806,6 +890,8 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
             Span::raw(" "),
             key("enter"),
             Span::raw(" jump   "),
+            key("n"),
+            Span::raw(" next   "),
             key("i"),
             Span::raw(" drive   "),
             key("p"),
@@ -831,12 +917,12 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
             ),
             Style::default().fg(Color::Indexed(196)),
         )),
-        Mode::Drive => Line::from(vec![
+        // Named from the pane being driven rather than from the cursor: they
+        // are allowed to differ, and the one taking the keys is the one worth
+        // showing.
+        Mode::Drive(pane) => Line::from(vec![
             Span::styled(
-                format!(
-                    " driving {} ",
-                    v.chosen.map(|i| v.items[i].address.as_str()).unwrap_or("")
-                ),
+                format!(" driving {} ", address_of(v.items, pane)),
                 Style::default().fg(Color::Indexed(208)),
             ),
             Span::raw("— keys go to the pane   "),
@@ -848,6 +934,14 @@ fn draw_footer(f: &mut ratatui::Frame, v: &View, area: ratatui::layout::Rect) {
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+fn address_of<'a>(items: &'a [Item], pane_id: &'a str) -> &'a str {
+    items
+        .iter()
+        .find(|item| item.pane_id == pane_id)
+        .map(|item| item.address.as_str())
+        .unwrap_or(pane_id)
 }
 
 fn crop(s: &str, max: usize) -> String {
@@ -966,12 +1060,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_blocked_session_is_watched_closely_and_a_quiet_one_is_not() {
-        let mut popup = Popup {
-            items: vec![item("codex", Kind::Session, 0)],
-            order: order(),
-            ai_count: 1,
+    fn popup_of(items: Vec<Item>, order: Vec<TreeRow>) -> Popup {
+        let ai_count = items.iter().filter(|i| i.kind.is_ai()).count();
+        Popup {
+            items,
+            order,
+            ai_count,
             cursor: 0,
             offset: 0,
             show_others: true,
@@ -980,14 +1074,138 @@ mod tests {
             cache: HashMap::new(),
             last_refresh: Instant::now(),
             jump: None,
-        };
+        }
+    }
+
+    fn session(title: &str, status: Status) -> Item {
+        let mut it = item(title, Kind::Session, 0);
+        it.status = Some(status);
+        it
+    }
+
+    fn panes_in_order(count: usize) -> Vec<TreeRow> {
+        let mut rows = vec![
+            TreeRow::Session("ws".to_string()),
+            TreeRow::Window {
+                index: 0,
+                name: "editor".to_string(),
+            },
+        ];
+        rows.extend((0..count).map(TreeRow::Pane));
+        rows
+    }
+
+    /// The bug this guards let a keystroke meant for one session reach another:
+    /// the cursor was a position in a list that rebuilds in a different order.
+    #[test]
+    fn the_selection_follows_the_pane_and_not_its_position() {
+        let items = vec![
+            session("first", Status::Blocked),
+            session("second", Status::Working),
+        ];
+        let mut popup = popup_of(items, panes_in_order(2));
+        assert_eq!(popup.selected_pane().as_deref(), Some("%first"));
+
+        // What a reload does when triage floats the other session up.
+        popup.order = vec![
+            TreeRow::Session("ws".to_string()),
+            TreeRow::Window {
+                index: 0,
+                name: "editor".to_string(),
+            },
+            TreeRow::Pane(1),
+            TreeRow::Pane(0),
+        ];
+        assert_eq!(
+            popup.selected_pane().as_deref(),
+            Some("%second"),
+            "the position alone now points at a different session"
+        );
+
+        popup.point_at("%first");
+        assert_eq!(popup.selected_pane().as_deref(), Some("%first"));
+    }
+
+    #[test]
+    fn driving_holds_its_pane_until_that_pane_is_gone() {
+        let mut popup = popup_of(vec![session("codex", Status::Blocked)], panes_in_order(1));
+        popup.mode = Mode::Drive("%codex".to_string());
+
+        popup.stop_driving_a_pane_that_has_gone();
+        assert!(
+            matches!(popup.mode, Mode::Drive(_)),
+            "the pane is still there"
+        );
+
+        popup.items.clear();
+        popup.stop_driving_a_pane_that_has_gone();
+        assert!(
+            matches!(popup.mode, Mode::Browse),
+            "keys with nowhere to go read as a popup that has stopped responding"
+        );
+    }
+
+    #[test]
+    fn the_cursor_opens_on_the_worst_thing_in_the_fleet() {
+        let items = vec![
+            session("quiet", Status::Working),
+            session("finished", Status::Waiting),
+            session("approval", Status::Blocked),
+        ];
+        let mut popup = popup_of(items, panes_in_order(3));
+        popup.point_at_what_most_needs_you();
+        assert_eq!(popup.selected_pane().as_deref(), Some("%approval"));
+    }
+
+    #[test]
+    fn n_walks_only_what_wants_you_and_wraps() {
+        let items = vec![
+            session("approval", Status::Blocked),
+            session("quiet", Status::Working),
+            session("finished", Status::Waiting),
+            item("nvim", Kind::Tool, 0),
+        ];
+        let mut popup = popup_of(items, panes_in_order(4));
+        popup.point_at_what_most_needs_you();
+        assert_eq!(popup.selected_pane().as_deref(), Some("%approval"));
+
+        popup.point_at_next_needing_you(Scan::Forwards);
+        assert_eq!(
+            popup.selected_pane().as_deref(),
+            Some("%finished"),
+            "a working session and an editor are not waiting on anyone"
+        );
+
+        popup.point_at_next_needing_you(Scan::Forwards);
+        assert_eq!(popup.selected_pane().as_deref(), Some("%approval"), "wraps");
+
+        popup.point_at_next_needing_you(Scan::Backwards);
+        assert_eq!(popup.selected_pane().as_deref(), Some("%finished"));
+    }
+
+    #[test]
+    fn nothing_moves_when_the_whole_fleet_is_quiet() {
+        let mut popup = popup_of(
+            vec![session("a", Status::Working), session("b", Status::Working)],
+            panes_in_order(2),
+        );
+        popup.cursor = 1;
+        popup.point_at_next_needing_you(Scan::Forwards);
+        assert_eq!(popup.cursor, 1);
+        popup.point_at_what_most_needs_you();
+        assert_eq!(popup.cursor, 1);
+    }
+
+    #[test]
+    fn a_blocked_session_is_watched_closely_and_a_quiet_one_is_not() {
+        let mut popup = popup_of(vec![item("codex", Kind::Session, 0)], order());
         assert_eq!(popup.preview_max_age(Some(0)), PREVIEW_MAX_AGE);
 
         popup.items[0].status = Some(Status::Blocked);
         assert_eq!(popup.preview_max_age(Some(0)), LIVE_PREVIEW_MAX_AGE);
 
         popup.items[0].status = None;
-        popup.mode = Mode::Drive;
+        popup.mode = Mode::Drive("%codex".to_string());
         assert_eq!(popup.preview_max_age(Some(0)), LIVE_PREVIEW_MAX_AGE);
     }
 
