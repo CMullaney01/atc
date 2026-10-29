@@ -237,8 +237,7 @@ fn refresh_window_for(pane_id: &str) {
     write_window_glyphs(&entries, &info.session, info.window_index);
 }
 
-/// Refreshes every window's glyphs, including the ones only a screen reading
-/// knows about. tmux runs this once per status redraw.
+/// Refreshes every window's glyphs. tmux runs this once per status redraw.
 ///
 /// It deliberately does not call `tmux::refresh_client()`. Forcing a redraw
 /// would re-run the status line, which runs this again, for ever. Writing the
