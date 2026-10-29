@@ -320,6 +320,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_pane_and_the_process_in_it() {
+        let line = format!("%12{s}48213", s = SEP);
+        assert_eq!(parse_pane_pid_line(&line), Some(("%12".to_string(), 48213)));
+    }
+
+    #[test]
+    fn a_pane_with_no_process_is_skipped_rather_than_guessed_at() {
+        assert_eq!(parse_pane_pid_line(&format!("%12{s}", s = SEP)), None);
+        assert_eq!(parse_pane_pid_line("%12"), None);
+    }
+
+    #[test]
     fn parses_a_pane_line() {
         let line = format!(
             "%6{s}myworkspace{s}0{s}nvim{s}1{s}1{s}1{s}1{s}✳ fix-lint{s}2.1.308\
