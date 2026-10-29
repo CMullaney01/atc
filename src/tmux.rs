@@ -61,6 +61,22 @@ pub(crate) fn available() -> bool {
     run(&["-V"]).is_some()
 }
 
+/// The process sitting in each pane. Only the path that repairs a wrong pane
+/// id asks for this, so it is a call of its own rather than two more fields on
+/// the list every redraw reads.
+pub(crate) fn pane_pids() -> Vec<(String, u32)> {
+    let fmt = format!("#{{pane_id}}{s}#{{pane_pid}}", s = SEP);
+    let Some(out) = run(&["list-panes", "-a", "-F", &fmt]) else {
+        return Vec::new();
+    };
+    out.lines().filter_map(parse_pane_pid_line).collect()
+}
+
+fn parse_pane_pid_line(line: &str) -> Option<(String, u32)> {
+    let (id, pid) = line.split_once(SEP)?;
+    Some((id.to_string(), pid.trim().parse().ok()?))
+}
+
 pub(crate) fn list_panes() -> Vec<PaneInfo> {
     let fmt = format!(
         "#{{pane_id}}{s}#{{session_name}}{s}#{{window_index}}{s}#{{window_name}}{s}\
@@ -301,6 +317,18 @@ mod tests {
     fn capture_of_an_empty_pane_is_empty() {
         assert!(trim_blank_tail("\n\n\n").is_empty());
         assert!(trim_blank_tail("").is_empty());
+    }
+
+    #[test]
+    fn parses_a_pane_and_the_process_in_it() {
+        let line = format!("%12{s}48213", s = SEP);
+        assert_eq!(parse_pane_pid_line(&line), Some(("%12".to_string(), 48213)));
+    }
+
+    #[test]
+    fn a_pane_with_no_process_is_skipped_rather_than_guessed_at() {
+        assert_eq!(parse_pane_pid_line(&format!("%12{s}", s = SEP)), None);
+        assert_eq!(parse_pane_pid_line("%12"), None);
     }
 
     #[test]
