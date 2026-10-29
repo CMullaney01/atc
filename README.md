@@ -173,18 +173,16 @@ session needs you, and a glyph for every shell would bury that.
 Four, and each keeps its hooks somewhere different. `atc install --tool <name>`
 prints the right block for one of them.
 
-| Agent | Hook config | Read off its screen |
-|---|---|---|
-| `claude` | `~/.claude/settings.json` → `hooks` | working, blocked, waiting |
-| `codex` | `~/.codex/config.toml` → `[hooks]` | working, blocked, waiting |
-| `gemini` | `~/.gemini/settings.json` → `hooks` | blocked |
-| `copilot` | `~/.copilot/hooks/atc.json` | nothing |
+| Agent | Hook config |
+|---|---|
+| `claude` | `~/.claude/settings.json` → `hooks` |
+| `codex` | `~/.codex/config.toml` → `[hooks]` |
+| `gemini` | `~/.gemini/settings.json` → `hooks` |
+| `copilot` | `~/.copilot/hooks/atc.json` |
 
-Hooks are the real mechanism and cover every state for all four. The last
-column is only the fallback for a session that started before atc was watching.
-It's thinner for the others because their screen markers are quoted from their
-source rather than seen working — `atc doctor` says which is which. Copilot is
-closed source and publishes no screen text, so atc doesn't guess at it at all.
+Hooks are the whole mechanism and cover every state for all four. atc never
+reads a pane's screen to work out how a session is doing: a session says what
+it is doing, or atc says it does not know.
 
 Two gotchas worth knowing, both of which make a hook silently never run: gemini
 only runs hooks in folders you have **trusted**, and codex ignores a
@@ -205,15 +203,15 @@ through each agent, so "configured" and "working" stay separate claims.
 ## Sessions that never reported
 
 A session that started before atc was watching has fired no hook, so there's
-nothing on disk for it. Rather than show it as unknown, atc reads its screen:
-the interrupt hint means it's working, a permission question with numbered
-options means it's blocked, and a bare input box means it's waiting for you.
-Anything it doesn't recognise stays unknown.
+nothing on disk for it, and it shows as unknown until it fires one. atc used to
+guess from the pane's screen by matching strings an agent's interface happens to
+print. Those strings are not a contract: three of the four agents' were quoted
+from source and never run, a marker only matched on one line so a narrow pane
+read as unknown anyway, and a wrong guess is worse than no answer. It's gone.
 
-These are guesses about a current interface, not a contract, so they're marked
-`~` everywhere they appear and a real hook always wins. Nothing inferred is
-written to disk: the most recent guess is cached on the pane itself, where it
-dies with the pane and can never be mistaken for something a hook reported.
+For Claude a tool call fires a hook, so an unseen session identifies itself
+within seconds of doing anything. One sitting idle stays unknown until you
+touch it, which is the honest answer. `atc state <status>` sets one by hand.
 
 ## How it works
 
@@ -242,19 +240,9 @@ something happens to it.
   leaves a shell, not a session. The file is left alone rather than deleted,
   because a pane briefly reports a pager the agent opened and a glyph that
   comes back on its own beats state thrown away for good.
-- The one thing read rather than reported is an **unreported** pane's screen.
-  A fleet where everything has reported captures nothing at all.
-- Twelve screens per redraw is the cap, and the twelve are whichever were
-  looked at **longest ago**. A fixed twelve taken from the top of the list
-  would mean a thirteenth unreported pane was never looked at once, however
-  long it sat there — it showed `?` while its screen plainly said otherwise.
-  Going by staleness means every pane comes round, so the cap bounds how
-  *often* a pane is checked rather than whether it ever is. Raising the cap
-  would only move that cliff to a bigger fleet.
-- Between its turns a pane keeps the answer from its last look, held in a tmux
-  pane option, so a bounded budget doesn't turn a large fleet into a row of
-  question marks. A pane's options die with the pane, so nothing outlives what
-  it described.
+- Nothing is read off a pane to work out its state, so a redraw captures no
+  screens at all however big the fleet is. The popup's preview is the only
+  place a pane's screen is read, and only for the one pane you have selected.
 
 ## Install
 

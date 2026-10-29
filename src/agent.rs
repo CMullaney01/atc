@@ -10,19 +10,6 @@ pub(crate) enum Tool {
     Copilot,
 }
 
-/// Whether a tool's screen markers have been checked against a real screen.
-/// `atc doctor` reports this, because a guess that looks like a fact is the
-/// thing most likely to mislead you.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Confidence {
-    /// Seen working against a live session.
-    Seen,
-    /// Taken from the tool's own source, never run.
-    FromSource,
-    /// Nothing to go on.
-    None,
-}
-
 /// One hook registration: the event as the tool spells it, and the matcher to
 /// pass back on the command line when the tool supports them.
 pub(crate) struct HookSpec {
@@ -53,18 +40,6 @@ impl HookSpec {
         }
         out
     }
-}
-
-/// What to look for on a pane's screen when no hook has reported it.
-pub(crate) struct Markers {
-    /// Any one of these means the agent is working.
-    pub(crate) working: &'static [&'static str],
-    /// One of these plus a numbered option on screen means it is asking.
-    /// A question alone is prose; options alone are a menu.
-    pub(crate) questions: &'static [&'static str],
-    /// The start of its input box, which means it is waiting for a reply.
-    pub(crate) input: &'static [&'static str],
-    pub(crate) confidence: Confidence,
 }
 
 /// Every hook atc registers, per tool: the event under the tool's own name,
@@ -239,49 +214,6 @@ impl Tool {
             },
         }
     }
-
-    /// Markers are quoted from each tool's own source. The published docs do
-    /// not carry them, and inventing them is how a confident wrong answer gets
-    /// made, so a tool with nothing to quote gets nothing.
-    pub(crate) fn markers(self) -> Markers {
-        match self {
-            Tool::Claude => Markers {
-                working: &["esc to interrupt"],
-                questions: &["Do you want", "Do you trust"],
-                input: &["❯", "│ >"],
-                confidence: Confidence::Seen,
-            },
-            // Its status line reads "• Working (0s • esc to interrupt)", and
-            // "Yes, proceed" is the first option of its approval overlay. The
-            // placeholder is only on screen while the composer is empty, which
-            // means the turn has finished and it is ready for a reply.
-            Tool::Codex => Markers {
-                working: &["esc to interrupt"],
-                questions: &["Yes, proceed"],
-                input: &["Ask Codex to do anything"],
-                confidence: Confidence::FromSource,
-            },
-            // The three questions its tool-confirmation component can ask.
-            Tool::Gemini => Markers {
-                working: &[],
-                questions: &[
-                    "Apply this change?",
-                    "Do you want to proceed?",
-                    "Allow execution of MCP tool",
-                ],
-                input: &[],
-                confidence: Confidence::FromSource,
-            },
-            // Closed source, and its docs publish no screen text. Its hooks
-            // cover every state, so there is nothing to guess at.
-            Tool::Copilot => Markers {
-                working: &[],
-                questions: &[],
-                input: &[],
-                confidence: Confidence::None,
-            },
-        }
-    }
 }
 
 impl fmt::Display for Tool {
@@ -367,14 +299,5 @@ mod tests {
         assert_eq!(Tool::Claude.normalise("AfterAgent"), None);
         assert_eq!(Tool::Claude.normalise("agentStop"), None);
         assert_eq!(Tool::Codex.normalise("BeforeAgent"), None);
-    }
-
-    #[test]
-    fn copilot_has_nothing_to_read_off_a_screen() {
-        let m = Tool::Copilot.markers();
-        assert!(m.working.is_empty());
-        assert!(m.questions.is_empty());
-        assert!(m.input.is_empty());
-        assert_eq!(m.confidence, Confidence::None);
     }
 }

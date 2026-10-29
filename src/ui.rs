@@ -6,7 +6,7 @@ use crate::agent::Tool;
 use crate::bar::TreeRow;
 use crate::pane::Kind;
 use crate::state::{self, Status, Subagent};
-use crate::{bar, infer, tmux};
+use crate::{bar, tmux};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -46,7 +46,6 @@ struct Item {
     age: Option<u64>,
     repo: Option<String>,
     active: bool,
-    inferred: bool,
     subagents: Vec<Subagent>,
     tool: Option<Tool>,
 }
@@ -101,7 +100,6 @@ impl Item {
     fn age_label(&self) -> String {
         match self.age {
             Some(secs) => state::fmt_age(secs),
-            None if self.inferred => bar::INFERRED_MARK.to_string(),
             None => "-".to_string(),
         }
     }
@@ -360,8 +358,7 @@ fn repo_label(cwd: &str, cache: &mut HashMap<String, Option<String>>) -> Option<
 fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, Vec<TreeRow>, usize) {
     let states = state::all();
     let panes = tmux::list_panes();
-    let mut inv = bar::inventory(&states, &panes);
-    infer::decorate(&mut inv);
+    let inv = bar::inventory(&states, &panes);
     let order = bar::tree(&inv);
     let ai_count = inv.iter().filter(|e| e.kind.is_ai()).count();
     let items = inv
@@ -383,7 +380,6 @@ fn snapshot(cache: &mut HashMap<String, Option<String>>) -> (Vec<Item>, Vec<Tree
                 cache,
             ),
             active: e.info.is_current(),
-            inferred: e.is_inferred(),
             subagents: e.subagents().to_vec(),
             tool: e.tool(),
         })
@@ -767,14 +763,7 @@ fn item_line(item: &Item, chosen: bool) -> Line<'static> {
             base.fg(Color::Indexed(250)),
         ),
         Span::styled(item.glyph(), glyph_style),
-        Span::styled(
-            if item.inferred {
-                format!("{} ", bar::INFERRED_MARK)
-            } else {
-                "  ".to_string()
-            },
-            base.fg(Color::Indexed(244)),
-        ),
+        Span::styled("  ", base.fg(Color::Indexed(244))),
         Span::styled(format!("{:<24} ", crop(&item.title, 24)), base),
         Span::styled(
             format!("{:<8} ", item.tool.map(|t| t.id()).unwrap_or("")),
@@ -1010,7 +999,6 @@ mod tests {
             age: None,
             repo: None,
             active: false,
-            inferred: false,
             tool: matches!(kind, Kind::Session | Kind::Unreported).then_some(Tool::Claude),
             subagents: (0..agents)
                 .map(|i| Subagent {
@@ -1359,11 +1347,8 @@ mod tests {
     }
 
     #[test]
-    fn an_inferred_state_shows_no_age() {
-        let mut it = item("claude", Kind::Unreported, 0);
-        it.inferred = true;
-        assert_eq!(it.age_label(), bar::INFERRED_MARK);
-        it.inferred = false;
+    fn a_pane_with_no_reported_age_shows_a_dash() {
+        let it = item("claude", Kind::Unreported, 0);
         assert_eq!(it.age_label(), "-");
     }
 }

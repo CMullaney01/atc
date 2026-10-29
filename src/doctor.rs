@@ -4,7 +4,7 @@
 //!
 //! Each check prints its own line and returns how many problems it found, so
 //! doctor reads as the list of checks it runs.
-use crate::agent::{Confidence, Tool};
+use crate::agent::Tool;
 use crate::state::PaneState;
 use crate::{process, state, tmux};
 use std::collections::BTreeSet;
@@ -18,7 +18,6 @@ pub(crate) fn run() {
         None => println!("WARN  not inside tmux, so panes cannot be identified"),
     }
     println!("ok    {} tracked pane(s)", tracked.len());
-    report_screen_confidence();
 
     if problems > 0 {
         std::process::exit(1);
@@ -239,20 +238,6 @@ fn events_reaching_atc(tree: &serde_json::Value) -> BTreeSet<&str> {
 fn expand_home(path: &str) -> Option<std::path::PathBuf> {
     let rest = path.strip_prefix("~/")?;
     Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(rest))
-}
-
-/// Screen reading is a fallback for sessions that never fired a hook, and how
-/// much to trust it differs per agent. Say so rather than let a guess look
-/// like a report.
-fn report_screen_confidence() {
-    for tool in Tool::ALL {
-        let note = match tool.markers().confidence {
-            Confidence::Seen => "screen rules checked against a live session",
-            Confidence::FromSource => "screen rules taken from its source, never run",
-            Confidence::None => "no screen rules — relies on its hooks alone",
-        };
-        println!("      {:<8} {note}", tool.id());
-    }
 }
 
 #[cfg(test)]

@@ -11,20 +11,11 @@ pub(crate) struct Entry<'a> {
     pub(crate) info: &'a PaneInfo,
     pub(crate) state: Option<&'a PaneState>,
     pub(crate) kind: Kind,
-    /// Worked out from the pane's screen because no hook ever reported it. Only
-    /// ever consulted when there is no real state to use.
-    pub(crate) inferred: Option<Status>,
 }
 
 impl Entry<'_> {
     pub(crate) fn status(&self) -> Option<Status> {
-        self.state.map(|s| s.status).or(self.inferred)
-    }
-
-    /// True when the status above is a guess off the screen rather than
-    /// something the session said.
-    pub(crate) fn is_inferred(&self) -> bool {
-        self.state.is_none() && self.inferred.is_some()
+        self.state.map(|s| s.status)
     }
 
     /// Which agent this is: what the hook said if one has reported, otherwise
@@ -111,7 +102,6 @@ pub(crate) fn inventory<'a>(states: &'a [PaneState], panes: &'a [PaneInfo]) -> V
                 info,
                 state,
                 kind: pane::classify(info, state),
-                inferred: None,
             }
         })
         .collect();
@@ -206,10 +196,6 @@ fn group_by_window(entries: &[Entry]) -> Vec<SessionGroup> {
     }
     by_session.into_iter().collect()
 }
-
-/// Marks a state worked out from a pane's screen rather than reported by a
-/// hook, wherever one is shown.
-pub(crate) const INFERRED_MARK: &str = "~";
 
 /// Whether the bar paints its own glyphs or leaves them in the status bar's
 /// colours. Off is a useful fallback for a bar whose styling the palette fights.
@@ -364,7 +350,6 @@ mod tests {
             path: "/tmp".to_string(),
             tty: "ttys001".to_string(),
             argv: String::new(),
-            infer: String::new(),
         }
     }
 
@@ -492,16 +477,15 @@ mod tests {
     }
 
     #[test]
-    fn an_inferred_status_is_used_but_flagged() {
+    fn a_pane_that_never_reported_is_left_unknown_rather_than_guessed_at() {
         let panes = [pane("%1", "ws", 0, "claude", 0, "2.1.308")];
-        let mut inv = inventory(&[], &panes);
+        let inv = inventory(&[], &panes);
         assert_eq!(inv[0].status(), None);
-        assert!(!inv[0].is_inferred());
-
-        inv[0].inferred = Some(Status::Waiting);
-        assert_eq!(inv[0].status(), Some(Status::Waiting));
-        assert!(inv[0].is_inferred());
-        assert_eq!(inv[0].glyph(), Status::Waiting.glyph());
+        assert_eq!(
+            inv[0].glyph(),
+            inv[0].kind.glyph(),
+            "with nothing reported it says what is running, not how it is doing"
+        );
     }
 
     #[test]
@@ -659,15 +643,6 @@ mod tests {
         let inv = inventory(&[], &panes);
         assert!(window_glyphs(&inv, "ws", 0, Paint::Colour).is_none());
         assert!(window_glyphs(&inv, "ws", 9, Paint::Colour).is_none());
-    }
-
-    #[test]
-    fn a_session_known_only_from_its_screen_still_reaches_the_window() {
-        let panes = [pane("%1", "ws", 0, "claude", 0, "2.1.308")];
-        let mut inv = inventory(&[], &panes);
-        inv[0].inferred = Some(Status::Waiting);
-        let g = window_glyphs(&inv, "ws", 0, Paint::Colour).expect("a cluster");
-        assert!(g.contains(Status::Waiting.glyph()), "glyph was: {g}");
     }
 
     #[test]

@@ -4,7 +4,6 @@ mod agent;
 mod bar;
 mod doctor;
 mod hook;
-mod infer;
 mod pane;
 mod process;
 mod state;
@@ -249,8 +248,7 @@ fn cmd_sync() {
     let live: Vec<String> = panes.iter().map(|p| p.pane_id.clone()).collect();
     state::prune(&live);
     let states = state::all();
-    let mut entries = bar::inventory(&states, &panes);
-    infer::decorate(&mut entries);
+    let entries = bar::inventory(&states, &panes);
 
     let mut seen: Vec<(String, u32)> = panes
         .iter()
@@ -279,16 +277,14 @@ fn cmd_bar(args: &[String]) {
         .or_else(tmux::current_session);
     let states = state::all();
     let panes = tmux::list_panes();
-    let mut inv = bar::inventory(&states, &panes);
-    infer::decorate(&mut inv);
+    let inv = bar::inventory(&states, &panes);
     println!("{}", bar::render(&inv, session.as_deref(), opts));
 }
 
 fn cmd_status(args: &[String]) {
     let states = state::all();
     let panes = tmux::list_panes();
-    let mut inv = bar::inventory(&states, &panes);
-    infer::decorate(&mut inv);
+    let inv = bar::inventory(&states, &panes);
 
     if args.iter().any(|a| a == "--json") {
         print_status_json(&inv);
@@ -312,7 +308,6 @@ fn print_status_json(inv: &[bar::Entry]) {
                 "kind": e.kind.label(),
                 "command": e.info.command,
                 "status": e.status().map(|s| s.label()),
-                "inferred": e.is_inferred(),
                 "source": e.state.map(|s| s.source.clone()),
                 "detected": e.tool().map(|t| t.id()),
                 "subagents": e.subagents().iter().map(|a| serde_json::json!({
@@ -349,27 +344,15 @@ fn print_status_tree(inv: &[bar::Entry]) {
 /// One pane, with whatever detail it has under it.
 fn print_status_pane(e: &bar::Entry) {
     println!(
-        "    {}{} {:<24} {:<11} {:>5}  {}{}",
+        "    {} {:<24} {:<11} {:>5}  {}{}",
         e.glyph(),
-        if e.is_inferred() {
-            bar::INFERRED_MARK
-        } else {
-            " "
-        },
         truncate(&e.title(), 24),
         e.status()
             .map(|s| s.label())
             .unwrap_or_else(|| e.kind.label()),
         e.state
             .map(|s| state::fmt_age(s.age_secs()))
-            .unwrap_or_else(|| {
-                if e.is_inferred() {
-                    bar::INFERRED_MARK
-                } else {
-                    "-"
-                }
-                .to_string()
-            }),
+            .unwrap_or_else(|| "-".to_string()),
         e.info.address(),
         if e.stale() { "  (stale)" } else { "" },
     );
