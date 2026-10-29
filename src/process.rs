@@ -86,6 +86,55 @@ pub(crate) fn command_lines() -> HashMap<String, String> {
     lines
 }
 
+/// The pane this process is running in, found by walking up its parents until
+/// one of them is the process tmux put in a pane. A hook runs as a child of
+/// the agent, which runs in a pane, so that pane is always an ancestor.
+pub(crate) fn pane_of_this_process(panes: &[(String, u32)]) -> Option<String> {
+    pane_from_ancestry(std::process::id(), &parent_map(), panes)
+}
+
+fn pane_from_ancestry(
+    pid: u32,
+    parents: &HashMap<u32, u32>,
+    panes: &[(String, u32)],
+) -> Option<String> {
+    let mut at = pid;
+    // A parent that is its own ancestor would otherwise spin for ever, and no
+    // real tree is anywhere near this deep.
+    for _ in 0..64 {
+        if let Some((pane, _)) = panes.iter().find(|(_, in_pane)| *in_pane == at) {
+            return Some(pane.clone());
+        }
+        at = *parents.get(&at)?;
+        if at <= 1 {
+            return None;
+        }
+    }
+    None
+}
+
+fn parent_map() -> HashMap<u32, u32> {
+    let Some(out) = ps_parents() else {
+        return HashMap::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+fn ps_parents() -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Whether a command can be run at all, which is how `atc doctor` tells an
 /// agent that is not installed from one whose hooks are simply missing.
 pub(crate) fn on_path(name: &str) -> bool {
@@ -108,6 +157,45 @@ fn ps() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parents(pairs: &[(u32, u32)]) -> HashMap<u32, u32> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_hook_belongs_to_the_pane_its_agent_runs_in() {
+        // The real shape: tmux put a shell in the pane, the shell started the
+        // agent, and the agent ran the hook that is asking.
+        let tree = parents(&[(900, 800), (800, 700), (700, 1)]);
+        let panes = [("%4".to_string(), 500), ("%7".to_string(), 700)];
+        assert_eq!(
+            pane_from_ancestry(900, &tree, &panes),
+            Some("%7".to_string())
+        );
+    }
+
+    #[test]
+    fn a_process_in_no_pane_at_all_is_not_guessed_at() {
+        let tree = parents(&[(900, 800), (800, 1)]);
+        let panes = [("%4".to_string(), 500)];
+        assert_eq!(pane_from_ancestry(900, &tree, &panes), None);
+    }
+
+    #[test]
+    fn a_process_that_is_its_own_ancestor_does_not_spin() {
+        let tree = parents(&[(900, 800), (800, 900)]);
+        let panes = [("%4".to_string(), 500)];
+        assert_eq!(pane_from_ancestry(900, &tree, &panes), None);
+    }
+
+    #[test]
+    fn the_pane_a_process_is_itself_in_needs_no_walking() {
+        let panes = [("%2".to_string(), 900)];
+        assert_eq!(
+            pane_from_ancestry(900, &parents(&[]), &panes),
+            Some("%2".to_string())
+        );
+    }
 
     #[test]
     fn npm_installed_agents_are_found_in_the_script_path() {

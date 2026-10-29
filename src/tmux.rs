@@ -61,6 +61,22 @@ pub(crate) fn available() -> bool {
     run(&["-V"]).is_some()
 }
 
+/// The process sitting in each pane. Only the path that repairs a wrong pane
+/// id asks for this, so it is a call of its own rather than two more fields on
+/// the list every redraw reads.
+pub(crate) fn pane_pids() -> Vec<(String, u32)> {
+    let fmt = format!("#{{pane_id}}{s}#{{pane_pid}}", s = SEP);
+    let Some(out) = run(&["list-panes", "-a", "-F", &fmt]) else {
+        return Vec::new();
+    };
+    out.lines().filter_map(parse_pane_pid_line).collect()
+}
+
+fn parse_pane_pid_line(line: &str) -> Option<(String, u32)> {
+    let (id, pid) = line.split_once(SEP)?;
+    Some((id.to_string(), pid.trim().parse().ok()?))
+}
+
 pub(crate) fn list_panes() -> Vec<PaneInfo> {
     let fmt = format!(
         "#{{pane_id}}{s}#{{session_name}}{s}#{{window_index}}{s}#{{window_name}}{s}\

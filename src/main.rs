@@ -140,6 +140,34 @@ fn parse_payload(event: &str, raw: &str) -> HookInput {
     }
 }
 
+/// Which pane to report on. `TMUX_PANE` is right almost always, but an agent
+/// started from inside another pane can inherit that pane's id, and state
+/// written for a pane tmux does not have is cleaned up again moments later. A
+/// session can run its whole life reporting nothing, with nothing to say why,
+/// so the pane is recovered from this process's own ancestry instead.
+///
+/// Only a pane that has never reported is worth the two extra calls: a wrong
+/// id never manages to keep any state, so it is always the first report that
+/// has to be put right.
+fn pane_to_report_on(from_env: String) -> String {
+    if state::load(&from_env).is_some() {
+        return from_env;
+    }
+    let panes = tmux::pane_pids();
+    if panes.iter().any(|(id, _)| *id == from_env) {
+        return from_env;
+    }
+    match process::pane_of_this_process(&panes) {
+        Some(real) => {
+            log(&format!(
+                "TMUX_PANE says {from_env}, which tmux has no pane for; reporting for {real}"
+            ));
+            real
+        }
+        None => from_env,
+    }
+}
+
 fn cmd_hook(args: &[String]) {
     let Some(event) = event_arg(args) else {
         log("hook called without an event name");
@@ -150,7 +178,7 @@ fn cmd_hook(args: &[String]) {
         return;
     };
 
-    let Some(pane_id) = tmux::current_pane() else {
+    let Some(pane_id) = tmux::current_pane().map(pane_to_report_on) else {
         return; // not running under tmux; nothing to report to
     };
 
