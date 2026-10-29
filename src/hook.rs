@@ -208,13 +208,21 @@ fn transition(
             Step::to(Status::Waiting)
         }
         "StopFailure" | "PostToolUseFailure" => Step::to(Status::Error),
-        // Notification is an escalation signal only: permission_prompt lags the
-        // real prompt by ~6s and idle_prompt by ~60s, so Stop and
-        // PermissionRequest drive state and these just flag it as ignored.
+        // Claude's permission_prompt lags the real prompt by ~6s and its
+        // idle_prompt by ~60s, so where something has already said the pane is
+        // blocked this only flags it as ignored. Copilot has no earlier signal
+        // worth trusting, so there this is the first word and marking it
+        // ignored on arrival would be a lie.
         // Gemini has no matchers, so it names the alert in the payload instead.
         // Reading both means one arm serves every agent.
         "Notification" => match kind.or(input.notification_type.as_deref()) {
-            Some("permission_prompt" | "ToolPermission") => Step::escalate(Some(Status::Blocked)),
+            Some("permission_prompt" | "ToolPermission" | "elicitation_dialog") => {
+                if st.status == Status::Blocked {
+                    Step::escalate(Some(Status::Blocked))
+                } else {
+                    Step::to(Status::Blocked)
+                }
+            }
             Some("idle_prompt") => Step::escalate(None),
             _ => None,
         },
@@ -235,6 +243,12 @@ mod tests {
             Outcome::Update(st) => *st,
             other => panic!("expected an update, got {:?}", other),
         }
+    }
+
+    fn notification(kind: &str) -> HookInput {
+        let mut i = input();
+        i.notification_type = Some(kind.into());
+        i
     }
 
     fn with_agent(id: &str, kind: &str) -> HookInput {
@@ -427,7 +441,44 @@ mod tests {
             None,
         ));
         assert_eq!(st.status, Status::Blocked);
+        assert!(
+            !st.stale,
+            "the only signal on a pane cannot be one you have already ignored"
+        );
+    }
+
+    #[test]
+    fn permission_notification_escalates_a_pane_already_known_to_be_blocked() {
+        let mut prev = PaneState::new("%6");
+        prev.status = Status::Blocked;
+        let before = prev.since;
+        let st = updated(apply(
+            "Notification",
+            Some("permission_prompt"),
+            &input(),
+            "%6",
+            Some(prev),
+        ));
+        assert_eq!(st.status, Status::Blocked);
         assert!(st.stale);
+        assert_eq!(
+            st.since, before,
+            "escalation must not reset the age counter"
+        );
+    }
+
+    #[test]
+    fn being_asked_for_more_information_blocks_the_pane() {
+        let mut prev = PaneState::new("%6");
+        prev.status = Status::Working;
+        let st = updated(apply(
+            "Notification",
+            None,
+            &notification("elicitation_dialog"),
+            "%6",
+            Some(prev),
+        ));
+        assert_eq!(st.status, Status::Blocked);
     }
 
     #[test]

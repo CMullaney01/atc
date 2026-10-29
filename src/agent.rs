@@ -121,7 +121,7 @@ const COPILOT_HOOKS: &[HookSpec] = &[
     HookSpec::plain("preToolUse"),
     HookSpec::plain("postToolUse"),
     HookSpec::plain("postToolUseFailure"),
-    HookSpec::plain("permissionRequest"),
+    HookSpec::plain("notification"),
     HookSpec::plain("agentStop"),
     HookSpec::plain("sessionEnd"),
     HookSpec::plain("subagentStart"),
@@ -213,7 +213,12 @@ impl Tool {
                 "preToolUse" => Some("PreToolUse"),
                 "postToolUse" => Some("PostToolUse"),
                 "postToolUseFailure" => Some("PostToolUseFailure"),
-                "permissionRequest" => Some("PermissionRequest"),
+                // Copilot fires this before its permission service runs, so it
+                // comes for every tool call, including the ones it goes on to
+                // allow by itself. Reading it as a question put an exclamation
+                // mark on panes that were only working. Its notification says
+                // when it is really asking.
+                "permissionRequest" => None,
                 "agentStop" => Some("Stop"),
                 "errorOccurred" => Some("StopFailure"),
                 "sessionEnd" => Some("SessionEnd"),
@@ -313,9 +318,31 @@ mod tests {
         assert_eq!(c.normalise("agentStop"), Some("Stop"));
         assert_eq!(c.normalise("userPromptSubmitted"), Some("UserPromptSubmit"));
         assert_eq!(c.normalise("preToolUse"), Some("PreToolUse"));
-        assert_eq!(c.normalise("permissionRequest"), Some("PermissionRequest"));
         assert_eq!(c.normalise("subagentStop"), Some("SubagentStop"));
         assert_eq!(c.normalise("userPromptTransformed"), None);
+    }
+
+    #[test]
+    fn copilots_permission_request_is_not_a_question() {
+        // It fires for every tool call, including the ones copilot allows on
+        // its own, so acting on it marks a working pane as blocked. An older
+        // install still has it registered, so it has to be ignored here rather
+        // than merely left unregistered.
+        assert_eq!(Tool::Copilot.normalise("permissionRequest"), None);
+        assert!(!Tool::Copilot
+            .hooks()
+            .iter()
+            .any(|h| h.event == "permissionRequest"));
+    }
+
+    #[test]
+    fn copilot_registers_the_notification_that_says_it_is_asking() {
+        let registered: Vec<&str> = Tool::Copilot.hooks().iter().map(|h| h.event).collect();
+        assert!(registered.contains(&"notification"), "{registered:?}");
+        assert_eq!(
+            Tool::Copilot.normalise("notification"),
+            Some("Notification")
+        );
     }
 
     #[test]

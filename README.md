@@ -190,6 +190,12 @@ Two gotchas worth knowing, both of which make a hook silently never run: gemini
 only runs hooks in folders you have **trusted**, and codex ignores a
 project-local `.codex/config.toml` unless the project is trusted.
 
+One more, for copilot: its `permissionRequest` fires *before* it decides
+anything, so it arrives for every tool call including the ones it goes on to
+allow by itself. atc ignores it and reads copilot's `notification` instead,
+which is the event that means it is really asking you. If you registered atc's
+copilot hooks before this, re-run `atc install --tool copilot` to pick that up.
+
 `atc doctor` is built for that failure. It **parses** each installed agent's own
 config rather than searching it for text, because a handler registered at the
 wrong depth is read without complaint and never runs — on paper it looks exactly
