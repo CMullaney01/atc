@@ -31,6 +31,11 @@ pub(crate) struct HookInput {
     /// Which alert this is, for the agents that have no matchers to pass one.
     #[serde(default)]
     pub(crate) notification_type: Option<String>,
+    /// Work still running when a turn ended: a backgrounded command, an agent,
+    /// a monitor. Only whether there is any of it matters here, so nothing
+    /// inside an entry is read.
+    #[serde(default)]
+    pub(crate) background_tasks: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -108,10 +113,11 @@ pub(crate) fn apply(
         return track_subagent(event, input, prev);
     }
 
-    // A subagent finishing says nothing about whether the session as a whole
-    // wants input, so its Stop must never mark the pane as waiting.
-    let in_subagent = input.agent_id.is_some();
-    if in_subagent && !matches!(event, "PreToolUse" | "PostToolUse") {
+    // What a subagent does says nothing about whether the session as a whole
+    // wants input, so none of it may move the pane off what it was. The one
+    // exception is a permission prompt: it is asked of you, and the session
+    // gets no further until you answer it.
+    if input.agent_id.is_some() && event != "PermissionRequest" {
         return Outcome::Ignore;
     }
 
@@ -190,13 +196,21 @@ fn transition(
             st.tool = input.tool_name.clone();
             Step::to(Status::Blocked)
         }
+        // A turn also ends when the session hands its work to the background,
+        // and that work wakes it again when it is done. Nothing is waiting on
+        // you then, so the session is still working, and it keeps the agents
+        // that are the reason it has gone quiet.
         "Stop" => {
             st.tool = None;
-            st.subagents.clear();
             if let Some(msg) = &input.last_assistant_message {
                 st.last_message = Some(first_line(msg));
             }
-            Step::to(Status::Waiting)
+            if !input.background_tasks.is_empty() {
+                Step::to(Status::Working)
+            } else {
+                st.subagents.clear();
+                Step::to(Status::Waiting)
+            }
         }
         // Interrupting a turn stops it where it stood, so the session wants
         // input again. Nothing closing is sent with this, and the message from
@@ -372,6 +386,37 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_paused_on_background_work_is_not_waiting_on_you() {
+        let raw = r#"{"background_tasks":[{"id":"t1","type":"shell","status":"running","description":"cargo test"}]}"#;
+        let paused: HookInput =
+            serde_json::from_str(raw).expect("a stop payload carrying its work");
+        let mut working = PaneState::new("%6");
+        working.status = Status::Working;
+        working.subagents.push(state::Subagent {
+            id: "a1".into(),
+            agent_type: Some("Explore".into()),
+            since: state::now(),
+        });
+        let before = working.since;
+
+        let after = updated(apply("Stop", None, &paused, "%6", Some(working)));
+        assert_eq!(
+            after.status,
+            Status::Working,
+            "the turn ended because it handed work on, not because it wants a reply"
+        );
+        assert_eq!(
+            after.since, before,
+            "nothing changed, so the age must not move"
+        );
+        assert_eq!(
+            after.subagents.len(),
+            1,
+            "the agent running underneath it is why the session is quiet"
+        );
+    }
+
+    #[test]
     fn stop_marks_the_pane_waiting_and_keeps_the_last_line() {
         let mut i = input();
         i.last_assistant_message = Some("Fixed the 3 type errors.\n\nWant me to run tests?".into());
@@ -379,6 +424,22 @@ mod tests {
         assert_eq!(st.status, Status::Waiting);
         assert_eq!(st.last_message.as_deref(), Some("Fixed the 3 type errors."));
         assert_eq!(st.tool, None);
+    }
+
+    #[test]
+    fn a_subagents_tool_call_does_not_free_a_blocked_pane() {
+        let mut blocked = PaneState::new("%6");
+        blocked.status = Status::Blocked;
+        blocked.tool = Some("Bash".into());
+        let mut from_subagent = input();
+        from_subagent.agent_id = Some("a1".into());
+        from_subagent.tool_name = Some("Read".into());
+
+        assert_eq!(
+            apply("PreToolUse", None, &from_subagent, "%6", Some(blocked)),
+            Outcome::Ignore,
+            "the session is still waiting on an approval, whatever its agent is doing"
+        );
     }
 
     #[test]
@@ -400,6 +461,29 @@ mod tests {
         assert_eq!(st.status, Status::Working);
         assert!(!st.stale);
         assert_eq!(st.last_message, None);
+    }
+
+    #[test]
+    fn a_subagent_asking_for_permission_blocks_the_session() {
+        let mut asking = input();
+        asking.agent_id = Some("a1".into());
+        asking.tool_name = Some("Bash".into());
+        let mut working = PaneState::new("%6");
+        working.status = Status::Working;
+
+        let st = updated(apply(
+            "PermissionRequest",
+            None,
+            &asking,
+            "%6",
+            Some(working),
+        ));
+        assert_eq!(
+            st.status,
+            Status::Blocked,
+            "the prompt is asked of you whichever agent raised it"
+        );
+        assert_eq!(st.tool.as_deref(), Some("Bash"));
     }
 
     #[test]

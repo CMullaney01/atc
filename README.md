@@ -138,6 +138,15 @@ land on one — which is also why the agent list leaves them out entirely.
 Bold means you've been ignoring it for a minute (`Notification`). Visiting the
 pane clears the bold; the glyph itself stays until the session gets a reply.
 
+A turn that ends only because it handed work to the background — a backgrounded
+command, a subagent, a monitor — stays `◐`. `Stop` carries what is still in
+flight, so a session that will wake itself isn't reported as wanting you, and
+the `⑂` rows under it stay where they are.
+
+What a subagent does says nothing about whether the session wants you, so none
+of it moves the glyph. The exception is a permission prompt: it's asked of you
+whichever agent raised it, so it blocks the pane like any other.
+
 `Notification` is deliberately **not** the primary signal: its
 `permission_prompt` matcher fires ~6s after the prompt appears and
 `idle_prompt` ~60s after the session goes quiet. `Stop` and `PermissionRequest`
